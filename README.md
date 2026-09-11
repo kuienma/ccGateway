@@ -29,6 +29,22 @@ go run ./cmd/gateway
 
 区域同时支持 AWS_REGION 与 AWS_DEFAULT_REGION，若两者都设置则 AWS_REGION 优先。服务默认监听 `:8080`。启动时会立即校验 `configs/models.json`，AWS 凭证由 SDK 在首次调用时从默认凭证链解析。
 
+## 启停脚本
+
+项目提供统一管理脚本：
+
+```bash
+./scripts/gateway.sh start    # 后台启动并通过 healthz 确认成功
+./scripts/gateway.sh status   # 查看运行状态
+./scripts/gateway.sh reload   # 修改 models.json 后热更新
+./scripts/gateway.sh restart  # 重启
+./scripts/gateway.sh stop     # SIGTERM 优雅停止
+./scripts/gateway.sh logs     # 持续查看日志
+./scripts/gateway.sh run      # 前台运行
+```
+
+默认读取项目根目录 `.env`，运行文件保存到 `.runtime/`。也可以通过 `GATEWAY_ENV_FILE` 和 `GATEWAY_RUNTIME_DIR` 指定其他路径。`stop` 默认等待 20 秒，可通过 `STOP_WAIT_SECONDS` 调整。
+
 ## Claude 客户端
 
 Claude Code 连接本地网关：
