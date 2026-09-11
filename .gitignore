@@ -1,0 +1,4 @@
+.env
+gateway
+coverage.out
+.DS_Store

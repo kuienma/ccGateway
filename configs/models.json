@@ -1,0 +1,19 @@
+{
+  "default": "opus-5",
+  "models": [
+    {
+      "id": "global.anthropic.claude-opus-5",
+      "aliases": [
+        "claude-opus-5",
+        "opus-5"
+      ]
+    },
+    {
+      "id": "global.anthropic.claude-opus-4-8",
+      "aliases": [
+        "claude-opus-4-8",
+        "opus-4-8"
+      ]
+    }
+  ]
+}
