@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/anthropic"
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/bedrock"
@@ -22,12 +23,15 @@ type contextKey string
 const requestIDContextKey contextKey = "request-id"
 
 type Server struct {
-	apiKey       string
-	maxBodyBytes int64
-	resolver     anthropic.ModelResolver
-	runtime      bedrock.Runtime
-	logger       *slog.Logger
-	handler      http.Handler
+	apiKey                  string
+	maxBodyBytes            int64
+	resolver                anthropic.ModelResolver
+	runtime                 bedrock.Runtime
+	logger                  *slog.Logger
+	handler                 http.Handler
+	streamHeartbeatInterval time.Duration
+	streamQueueTimeout      time.Duration
+	streamSlots             chan struct{}
 }
 
 func NewServer(
@@ -36,13 +40,19 @@ func NewServer(
 	resolver anthropic.ModelResolver,
 	runtime bedrock.Runtime,
 	logger *slog.Logger,
+	streamHeartbeatInterval time.Duration,
+	maxConcurrentStreams int,
+	streamQueueTimeout time.Duration,
 ) *Server {
 	server := &Server{
-		apiKey:       apiKey,
-		maxBodyBytes: maxBodyBytes,
-		resolver:     resolver,
-		runtime:      runtime,
-		logger:       logger,
+		apiKey:                  apiKey,
+		maxBodyBytes:            maxBodyBytes,
+		resolver:                resolver,
+		runtime:                 runtime,
+		logger:                  logger,
+		streamHeartbeatInterval: streamHeartbeatInterval,
+		streamQueueTimeout:      streamQueueTimeout,
+		streamSlots:             make(chan struct{}, maxConcurrentStreams),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", server.handleHealth)
@@ -50,6 +60,23 @@ func NewServer(
 	mux.Handle("POST /v1/messages/count_tokens", server.authenticate(http.HandlerFunc(server.handleCountTokens)))
 	server.handler = server.withRequestID(mux)
 	return server
+}
+
+func (s *Server) acquireStream(ctx context.Context) bool {
+	timer := time.NewTimer(s.streamQueueTimeout)
+	defer timer.Stop()
+	select {
+	case s.streamSlots <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
+}
+
+func (s *Server) releaseStream() {
+	<-s.streamSlots
 }
 
 func (s *Server) Handler() http.Handler {

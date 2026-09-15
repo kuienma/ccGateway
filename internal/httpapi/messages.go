@@ -16,6 +16,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if prepared.Stream {
+		if !s.acquireStream(r.Context()) {
+			s.writeError(w, r, http.StatusServiceUnavailable, anthropic.ErrorTypeOverloaded, "流式请求并发已满")
+			return
+		}
+		defer s.releaseStream()
 		s.handleStream(w, r, prepared)
 		return
 	}

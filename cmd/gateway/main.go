@@ -51,7 +51,16 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return err
 	}
 	runtime := bedrock.NewClient(bedrockruntime.NewFromConfig(awsCfg))
-	api := httpapi.NewServer(cfg.GatewayAPIKey, cfg.MaxBodyBytes, models, runtime, logger)
+	api := httpapi.NewServer(
+		cfg.GatewayAPIKey,
+		cfg.MaxBodyBytes,
+		models,
+		runtime,
+		logger,
+		cfg.StreamHeartbeatInterval,
+		cfg.MaxConcurrentStreams,
+		cfg.StreamQueueTimeout,
+	)
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           api.Handler(),

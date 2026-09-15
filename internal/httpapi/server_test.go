@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
@@ -31,6 +33,25 @@ type runtimeStub struct {
 	streamChunks [][]byte
 	tokenCount   int32
 	err          error
+}
+
+type blockingRuntime struct {
+	runtimeStub
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingRuntime) Stream(ctx context.Context, modelID string, body []byte, _ func([]byte) error) error {
+	r.modelID = modelID
+	r.body = append([]byte(nil), body...)
+	r.once.Do(func() { close(r.started) })
+	select {
+	case <-r.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (r *runtimeStub) Invoke(_ context.Context, modelID string, body []byte) ([]byte, error) {
@@ -139,6 +160,68 @@ func TestMessagesAcceptsBearerTokenAndStreamsSSE(t *testing.T) {
 	}
 }
 
+func TestStreamSendsHeartbeatWhileWaitingForBedrock(t *testing.T) {
+	t.Parallel()
+
+	runtime := &blockingRuntime{started: make(chan struct{}), release: make(chan struct{})}
+	server := NewServer(
+		testGatewayKey,
+		1<<20,
+		resolverStub{"opus-5": "model-id"},
+		runtime,
+		discardLogger(),
+		5*time.Millisecond,
+		1,
+		20*time.Millisecond,
+	)
+	go func() {
+		<-runtime.started
+		time.Sleep(20 * time.Millisecond)
+		close(runtime.release)
+	}()
+
+	response := performRequest(
+		server,
+		http.MethodPost,
+		"/v1/messages",
+		[]byte(`{"model":"opus-5","max_tokens":1,"messages":[],"stream":true}`),
+		map[string]string{"x-api-key": testGatewayKey},
+	)
+	if !strings.Contains(response.Body.String(), ": ping\n\n") {
+		t.Fatalf("SSE 缺少心跳: %q", response.Body.String())
+	}
+}
+
+func TestStreamReturnsOverloadedWhenConcurrencySlotIsBusy(t *testing.T) {
+	t.Parallel()
+
+	runtime := &blockingRuntime{started: make(chan struct{}), release: make(chan struct{})}
+	server := NewServer(
+		testGatewayKey,
+		1<<20,
+		resolverStub{"opus-5": "model-id"},
+		runtime,
+		discardLogger(),
+		time.Hour,
+		1,
+		5*time.Millisecond,
+	)
+	body := []byte(`{"model":"opus-5","max_tokens":1,"messages":[],"stream":true}`)
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		firstDone <- performRequest(server, http.MethodPost, "/v1/messages", body, map[string]string{"x-api-key": testGatewayKey})
+	}()
+	<-runtime.started
+
+	second := performRequest(server, http.MethodPost, "/v1/messages", body, map[string]string{"x-api-key": testGatewayKey})
+	if second.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, body = %s", second.Code, second.Body.String())
+	}
+	assertErrorType(t, second.Body.Bytes(), anthropic.ErrorTypeOverloaded)
+	close(runtime.release)
+	<-firstDone
+}
+
 func TestCountTokensUsesBedrockResult(t *testing.T) {
 	t.Parallel()
 
@@ -172,7 +255,7 @@ func TestMessagesRejectsUnknownModel(t *testing.T) {
 func TestMessagesEnforcesBodyLimit(t *testing.T) {
 	t.Parallel()
 
-	server := NewServer(testGatewayKey, 8, resolverStub{}, &runtimeStub{}, discardLogger())
+	server := NewServer(testGatewayKey, 8, resolverStub{}, &runtimeStub{}, discardLogger(), time.Hour, 4, time.Second)
 	headers := map[string]string{"x-api-key": testGatewayKey}
 	response := performRequest(server, http.MethodPost, "/v1/messages", bytes.Repeat([]byte("x"), 9), headers)
 
@@ -216,7 +299,7 @@ func TestClassifyUpstreamErrorFallsBackToBadGatewayForMissingStatus(t *testing.T
 const testGatewayKey = "test-gateway-key"
 
 func newTestServer(runtime *runtimeStub, resolver resolverStub) *Server {
-	return NewServer(testGatewayKey, 1<<20, resolver, runtime, discardLogger())
+	return NewServer(testGatewayKey, 1<<20, resolver, runtime, discardLogger(), time.Hour, 4, time.Second)
 }
 
 func discardLogger() *slog.Logger {

@@ -1,9 +1,11 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/anthropic"
 )
@@ -23,21 +25,61 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, prepared a
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	err := s.runtime.Stream(r.Context(), prepared.ModelID, prepared.Body, func(chunk []byte) error {
-		eventType, err := streamEventType(chunk)
-		if err != nil {
-			return err
-		}
-		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, chunk); err != nil {
-			return err
-		}
-		flusher.Flush()
-		return nil
-	})
-	if err == nil {
-		return
-	}
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	chunks := make(chan []byte)
+	streamDone := make(chan error, 1)
+	go func() {
+		streamDone <- s.runtime.Stream(ctx, prepared.ModelID, prepared.Body, func(chunk []byte) error {
+			copied := append([]byte(nil), chunk...)
+			select {
+			case chunks <- copied:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+	}()
 
+	ticker := time.NewTicker(s.streamHeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case chunk := <-chunks:
+			if err := writeStreamChunk(w, flusher, chunk); err != nil {
+				s.logger.Error("写出流事件失败", "request_id", requestID(r.Context()), "error", err)
+				return
+			}
+		case err := <-streamDone:
+			if err != nil {
+				s.writeStreamError(w, r, flusher, err)
+			}
+			return
+		case <-ticker.C:
+			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+				s.logger.Error("写出 SSE 心跳失败", "request_id", requestID(r.Context()), "error", err)
+				return
+			}
+			flusher.Flush()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func writeStreamChunk(w http.ResponseWriter, flusher http.Flusher, chunk []byte) error {
+	eventType, err := streamEventType(chunk)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, chunk); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+func (s *Server) writeStreamError(w http.ResponseWriter, r *http.Request, flusher http.Flusher, err error) {
 	s.logger.Error("Bedrock 流式请求失败", "request_id", requestID(r.Context()), "error", err)
 	envelope := anthropic.ErrorEnvelope{
 		Type:      errorType,
