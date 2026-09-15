@@ -9,12 +9,15 @@ func TestLoadFromLookup(t *testing.T) {
 	t.Parallel()
 
 	values := map[string]string{
-		"AWS_REGION":        "us-east-1",
-		"GATEWAY_API_KEY":   "gateway-secret",
-		"MODEL_CONFIG_FILE": "/tmp/models.json",
-		"LISTEN_ADDR":       ":9090",
-		"MAX_BODY_BYTES":    "1024",
-		"SHUTDOWN_TIMEOUT":  "5s",
+		"AWS_REGION":                "us-east-1",
+		"GATEWAY_API_KEY":           "gateway-secret",
+		"MODEL_CONFIG_FILE":         "/tmp/models.json",
+		"LISTEN_ADDR":               ":9090",
+		"MAX_BODY_BYTES":            "1024",
+		"SHUTDOWN_TIMEOUT":          "5s",
+		"STREAM_HEARTBEAT_INTERVAL": "2s",
+		"MAX_CONCURRENT_STREAMS":    "6",
+		"STREAM_QUEUE_TIMEOUT":      "7s",
 	}
 
 	cfg, err := LoadFromLookup(func(key string) (string, bool) {
@@ -42,6 +45,15 @@ func TestLoadFromLookup(t *testing.T) {
 	}
 	if cfg.ShutdownTimeout != 5*time.Second {
 		t.Fatalf("ShutdownTimeout = %s", cfg.ShutdownTimeout)
+	}
+	if cfg.StreamHeartbeatInterval != 2*time.Second {
+		t.Fatalf("StreamHeartbeatInterval = %s", cfg.StreamHeartbeatInterval)
+	}
+	if cfg.MaxConcurrentStreams != 6 {
+		t.Fatalf("MaxConcurrentStreams = %d", cfg.MaxConcurrentStreams)
+	}
+	if cfg.StreamQueueTimeout != 7*time.Second {
+		t.Fatalf("StreamQueueTimeout = %s", cfg.StreamQueueTimeout)
 	}
 }
 
@@ -89,6 +101,15 @@ func TestLoadFromLookupUsesDefaults(t *testing.T) {
 	if cfg.MaxBodyBytes != DefaultMaxBodyBytes {
 		t.Fatalf("MaxBodyBytes = %d", cfg.MaxBodyBytes)
 	}
+	if cfg.StreamHeartbeatInterval != DefaultStreamHeartbeatInterval {
+		t.Fatalf("StreamHeartbeatInterval = %s", cfg.StreamHeartbeatInterval)
+	}
+	if cfg.MaxConcurrentStreams != DefaultMaxConcurrentStreams {
+		t.Fatalf("MaxConcurrentStreams = %d", cfg.MaxConcurrentStreams)
+	}
+	if cfg.StreamQueueTimeout != DefaultStreamQueueTimeout {
+		t.Fatalf("StreamQueueTimeout = %s", cfg.StreamQueueTimeout)
+	}
 }
 
 func TestLoadFromLookupRejectsMissingRequiredValues(t *testing.T) {
@@ -132,5 +153,37 @@ func TestLoadFromLookupRejectsInvalidLimits(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("预期 MAX_BODY_BYTES 校验失败")
+	}
+}
+
+func TestLoadFromLookupRejectsInvalidStabilitySettings(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "心跳间隔", key: "STREAM_HEARTBEAT_INTERVAL", value: "0s"},
+		{name: "流并发数", key: "MAX_CONCURRENT_STREAMS", value: "0"},
+		{name: "排队超时", key: "STREAM_QUEUE_TIMEOUT", value: "invalid"},
+	}
+	for _, testCase := range testCases {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			values := map[string]string{
+				"AWS_REGION":      "us-east-1",
+				"GATEWAY_API_KEY": "gateway-secret",
+				testCase.key:      testCase.value,
+			}
+			_, err := LoadFromLookup(func(key string) (string, bool) {
+				value, ok := values[key]
+				return value, ok
+			})
+			if err == nil {
+				t.Fatal("预期稳定性配置校验失败")
+			}
+		})
 	}
 }
