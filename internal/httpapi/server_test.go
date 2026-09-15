@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -192,6 +193,22 @@ func TestClassifyUpstreamErrorMapsRateLimit(t *testing.T) {
 		t.Fatalf("映射结果 = %d, %s", status, kind)
 	}
 	if message != "请求过于频繁" {
+		t.Fatalf("message = %q", message)
+	}
+}
+
+func TestClassifyUpstreamErrorFallsBackToBadGatewayForMissingStatus(t *testing.T) {
+	t.Parallel()
+
+	err := &smithyhttp.ResponseError{
+		Response: &smithyhttp.Response{Response: &http.Response{StatusCode: 0}},
+		Err:      errors.New("unexpected EOF"),
+	}
+	status, kind, message := classifyUpstreamError(err)
+	if status != http.StatusBadGateway || kind != anthropic.ErrorTypeAPI {
+		t.Fatalf("映射结果 = %d, %s", status, kind)
+	}
+	if message != "Bedrock 请求失败" {
 		t.Fatalf("message = %q", message)
 	}
 }

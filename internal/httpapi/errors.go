@@ -33,7 +33,10 @@ func classifyUpstreamError(err error) (int, string, string) {
 
 	var responseError *smithyhttp.ResponseError
 	if errors.As(err, &responseError) {
-		status = responseError.HTTPStatusCode()
+		responseStatus := responseError.HTTPStatusCode()
+		if responseStatus >= 100 && responseStatus <= 599 {
+			status = responseStatus
+		}
 	}
 	switch status {
 	case http.StatusBadRequest:
