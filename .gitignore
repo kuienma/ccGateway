@@ -1,5 +1,5 @@
 .env
-gateway
+/gateway
 coverage.out
 .DS_Store
 .runtime/
