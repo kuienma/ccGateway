@@ -45,6 +45,34 @@ go run ./cmd/gateway
 
 默认读取项目根目录 `.env`，运行文件保存到 `.runtime/`。也可以通过 `GATEWAY_ENV_FILE` 和 `GATEWAY_RUNTIME_DIR` 指定其他路径。`stop` 默认等待 20 秒，可通过 `STOP_WAIT_SECONDS` 调整。
 
+本地网络需要代理才能访问 Anthropic Bedrock 模型时，应把代理变量明确写入 `.env`，避免后台进程没有继承终端环境：
+
+```bash
+HTTP_PROXY=http://127.0.0.1:7897
+HTTPS_PROXY=http://127.0.0.1:7897
+ALL_PROXY=socks5://127.0.0.1:7897
+```
+
+不要把 `bedrock-runtime.<region>.amazonaws.com` 加入 `NO_PROXY`，除非已经确认当前公网出口所在地区受到 Anthropic 支持。
+
+流式稳定性可以通过以下变量调整：
+
+```bash
+STREAM_HEARTBEAT_INTERVAL=15s # 网关发给 SSE 客户端的注释心跳
+MAX_CONCURRENT_STREAMS=4      # 同时执行的 Bedrock 流式请求数
+STREAM_QUEUE_TIMEOUT=30s      # 等待流式并发槽位的最长时间
+```
+
+网关在 Bedrock 暂无新事件时发送 `: ping` SSE 注释；客户端应忽略注释。并发槽位在等待超时后返回 `503 overloaded_error`。AWS SDK 使用 10 秒建连超时、30 秒 TCP keepalive、120 秒响应头超时和最多三次重试，单次最大退避限制为 5 秒；流式响应不设置覆盖整个生成过程的总超时。
+
+Clash Verge Rev / Mihomo 建议为 Bedrock 域名配置固定的支持地区节点，并启用：
+
+```yaml
+keep-alive-interval: 15
+keep-alive-idle: 15
+disable-keep-alive: false
+```
+
 ## Claude 客户端
 
 Claude Code 连接本地网关：
