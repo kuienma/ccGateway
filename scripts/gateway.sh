@@ -68,6 +68,12 @@ is_gateway_process() {
   [[ "${command}" == *"${BINARY_FILE}"* ]]
 }
 
+owns_listen_port() {
+  local pid="$1"
+  local port="$2"
+  lsof -nP -a -p "${pid}" -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
+}
+
 build_binary() {
   mkdir -p "${RUNTIME_DIR}"
   echo "正在构建网关..."
@@ -114,6 +120,22 @@ start_gateway() {
       return 1
     fi
     if command -v curl >/dev/null 2>&1 && curl --fail --silent --max-time 1 "$(health_url)" >/dev/null; then
+      local port="${LISTEN_ADDR:-${DEFAULT_LISTEN_ADDR}}"
+      port="${port##*:}"
+      if command -v lsof >/dev/null 2>&1; then
+        if ! owns_listen_port "${pid}" "${port}"; then
+          sleep "${START_CHECK_INTERVAL_SECONDS}"
+          continue
+        fi
+      else
+        sleep "${START_CHECK_INTERVAL_SECONDS}"
+        if ! kill -0 "${pid}" 2>/dev/null || ! is_gateway_process "${pid}"; then
+          continue
+        fi
+      fi
+      if ! kill -0 "${pid}" 2>/dev/null || ! is_gateway_process "${pid}"; then
+        continue
+      fi
       echo "网关启动成功，PID: ${pid}"
       echo "健康检查: $(health_url)"
       echo "日志文件: ${LOG_FILE}"
@@ -242,4 +264,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
