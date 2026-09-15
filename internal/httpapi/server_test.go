@@ -283,10 +283,10 @@ func TestStreamSendsHeartbeatWhileWaitingForBedrock(t *testing.T) {
 func TestStreamHeartbeatOnlyFiresWhileIdle(t *testing.T) {
 	t.Parallel()
 
-	runtime := &pacedStreamRuntime{interval: 5 * time.Millisecond, chunks: 5}
+	runtime := &pacedStreamRuntime{interval: 50 * time.Millisecond, chunks: 5}
 	server := NewServer(
 		testGatewayKey, 1<<20, resolverStub{"opus-5": "model-id"}, runtime,
-		discardLogger(), 20*time.Millisecond, 1, 20*time.Millisecond,
+		discardLogger(), 200*time.Millisecond, 1, 20*time.Millisecond,
 	)
 	response := performRequest(
 		server, http.MethodPost, "/v1/messages",

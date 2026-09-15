@@ -63,7 +63,7 @@ MAX_CONCURRENT_STREAMS=4      # 同时执行的 Bedrock 流式请求数
 STREAM_QUEUE_TIMEOUT=30s      # 等待流式并发槽位的最长时间
 ```
 
-网关在 Bedrock 暂无新事件时发送 `: ping` SSE 注释；每收到一个上游事件都会重新计算空闲时间，客户端应忽略注释。并发槽位在等待超时后返回 `503 overloaded_error`。AWS SDK 使用 10 秒建连超时、30 秒 TCP keepalive 和最多三次重试，单次最大退避限制为 5 秒；响应头和流式响应不设置覆盖整个生成过程的总超时。
+网关在 Bedrock 暂无新事件时发送 `: ping` SSE 注释；每收到一个上游事件都会重新计算空闲时间，客户端应忽略注释。并发槽位在等待超时后返回 `503 overloaded_error`。AWS SDK 使用 10 秒建连超时、30 秒 TCP keepalive、120 秒响应头超时和最多三次重试，单次最大退避限制为 5 秒；流式响应不设置覆盖整个生成过程的总超时。
 
 Clash Verge Rev / Mihomo 建议为 Bedrock 域名配置固定的支持地区节点，并启用：
 

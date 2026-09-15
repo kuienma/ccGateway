@@ -21,7 +21,7 @@ func TestNewHTTPClientAppliesBoundedConnectionSettings(t *testing.T) {
 	if transport.TLSHandshakeTimeout != 10*time.Second {
 		t.Fatalf("TLSHandshakeTimeout = %s", transport.TLSHandshakeTimeout)
 	}
-	if transport.ResponseHeaderTimeout != 0 {
+	if transport.ResponseHeaderTimeout != 120*time.Second {
 		t.Fatalf("ResponseHeaderTimeout = %s", transport.ResponseHeaderTimeout)
 	}
 	if transport.IdleConnTimeout != 90*time.Second {

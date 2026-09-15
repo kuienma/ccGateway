@@ -22,6 +22,7 @@ func newBuildableHTTPClient() *awshttp.BuildableClient {
 		}).
 		WithTransportOptions(func(transport *http.Transport) {
 			transport.TLSHandshakeTimeout = 10 * time.Second
+			transport.ResponseHeaderTimeout = 120 * time.Second
 			transport.IdleConnTimeout = 90 * time.Second
 			transport.MaxIdleConns = 100
 			transport.MaxIdleConnsPerHost = 20

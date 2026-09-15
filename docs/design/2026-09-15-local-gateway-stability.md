@@ -14,7 +14,7 @@
 ## 方案
 
 1. 请求转换层删除 Bedrock 当前不接受的 `output_config.format`；其他 `output_config` 字段继续保留。
-2. AWS SDK 使用冻结的专用 HTTP Client，避免 Defaults Mode 覆盖连接策略：10 秒建连、30 秒 TCP keepalive、10 秒 TLS 握手、90 秒空闲连接回收，并提高每主机空闲连接数。响应头不设置固定超时，避免切断耗时较长的非流式推理。
+2. AWS SDK 使用冻结的专用 HTTP Client，避免 Defaults Mode 覆盖连接策略：10 秒建连、30 秒 TCP keepalive、10 秒 TLS 握手、120 秒响应头等待、90 秒空闲连接回收，并提高每主机空闲连接数。
 3. AWS Standard Retry 保持最多 3 次，但把最大退避限制为 5 秒。SDK 只负责取得流式响应前的重试；开始消费流后不重放。
 4. SSE 写出由单一 goroutine 串行完成。Bedrock 连续 15 秒暂无事件时向客户端发送 `: ping` 注释；收到事件后重新计算空闲时间。
 5. 流式请求使用有界信号量，默认最多 4 个并发，排队最多 30 秒；超出后返回 `503 overloaded_error`。
