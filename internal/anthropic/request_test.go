@@ -72,6 +72,54 @@ func TestPrepareRequestUsesDefaultModel(t *testing.T) {
 	}
 }
 
+func TestPrepareRequestRemovesUnsupportedOutputFormat(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{
+		"model":"opus-5",
+		"max_tokens":1,
+		"messages":[],
+		"output_config":{"format":{"type":"json_schema"},"effort":"high"}
+	}`)
+	prepared, err := PrepareRequest(raw, nil, resolverStub{"opus-5": "model-id"})
+	if err != nil {
+		t.Fatalf("准备请求失败: %v", err)
+	}
+
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(prepared.Body, &body); err != nil {
+		t.Fatalf("解析 Bedrock body 失败: %v", err)
+	}
+	var outputConfig map[string]json.RawMessage
+	if err := json.Unmarshal(body["output_config"], &outputConfig); err != nil {
+		t.Fatalf("解析 output_config 失败: %v", err)
+	}
+	if _, exists := outputConfig["format"]; exists {
+		t.Fatal("Bedrock body 不应包含 output_config.format")
+	}
+	assertJSONString(t, outputConfig["effort"], "high")
+}
+
+func TestPrepareRequestRemovesEmptyOutputConfig(t *testing.T) {
+	t.Parallel()
+
+	prepared, err := PrepareRequest(
+		[]byte(`{"model":"opus-5","messages":[],"output_config":{"format":{"type":"json_schema"}}}`),
+		nil,
+		resolverStub{"opus-5": "model-id"},
+	)
+	if err != nil {
+		t.Fatalf("准备请求失败: %v", err)
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(prepared.Body, &body); err != nil {
+		t.Fatalf("解析 Bedrock body 失败: %v", err)
+	}
+	if _, exists := body["output_config"]; exists {
+		t.Fatal("空 output_config 应被删除")
+	}
+}
+
 func TestPrepareRequestRejectsUnknownModel(t *testing.T) {
 	t.Parallel()
 

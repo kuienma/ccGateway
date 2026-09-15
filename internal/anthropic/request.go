@@ -42,6 +42,7 @@ func PrepareRequest(raw []byte, betaFeatures []string, resolver ModelResolver) (
 
 	delete(body, "model")
 	delete(body, "stream")
+	removeUnsupportedOutputFormat(body)
 	body["anthropic_version"] = mustMarshal(BedrockAnthropicVersion)
 	if len(betaFeatures) > 0 {
 		body["anthropic_beta"] = mustMarshal(betaFeatures)
@@ -52,6 +53,23 @@ func PrepareRequest(raw []byte, betaFeatures []string, resolver ModelResolver) (
 		return PreparedRequest{}, invalidRequest("请求体无法编码")
 	}
 	return PreparedRequest{ModelID: modelID, Body: encoded, Stream: stream}, nil
+}
+
+func removeUnsupportedOutputFormat(body map[string]json.RawMessage) {
+	raw, exists := body["output_config"]
+	if !exists {
+		return
+	}
+	var outputConfig map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &outputConfig); err != nil || outputConfig == nil {
+		return
+	}
+	delete(outputConfig, "format")
+	if len(outputConfig) == 0 {
+		delete(body, "output_config")
+		return
+	}
+	body["output_config"] = mustMarshal(outputConfig)
 }
 
 func optionalString(body map[string]json.RawMessage, key string) (string, *RequestError) {
