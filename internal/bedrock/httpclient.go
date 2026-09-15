@@ -10,7 +10,11 @@ import (
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 )
 
-func NewHTTPClient() *awshttp.BuildableClient {
+func NewHTTPClient() aws.HTTPClient {
+	return newBuildableHTTPClient().Freeze()
+}
+
+func newBuildableHTTPClient() *awshttp.BuildableClient {
 	return awshttp.NewBuildableClient().
 		WithDialerOptions(func(dialer *net.Dialer) {
 			dialer.Timeout = 10 * time.Second
@@ -18,7 +22,6 @@ func NewHTTPClient() *awshttp.BuildableClient {
 		}).
 		WithTransportOptions(func(transport *http.Transport) {
 			transport.TLSHandshakeTimeout = 10 * time.Second
-			transport.ResponseHeaderTimeout = 120 * time.Second
 			transport.IdleConnTimeout = 90 * time.Second
 			transport.MaxIdleConns = 100
 			transport.MaxIdleConnsPerHost = 20

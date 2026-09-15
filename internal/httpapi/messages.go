@@ -36,7 +36,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	modelID = prepared.ModelID
 	stream = prepared.Stream
 	if prepared.Stream {
-		if !s.acquireStream(r.Context()) {
+		if err := s.acquireStream(r.Context()); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				result = "client_canceled"
+				return
+			}
 			result = "overloaded"
 			s.writeError(w, r, http.StatusServiceUnavailable, anthropic.ErrorTypeOverloaded, "流式请求并发已满")
 			return
@@ -49,6 +53,9 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	response, err := s.runtime.Invoke(r.Context(), prepared.ModelID, prepared.Body)
 	if err != nil {
 		result = completionResult(err)
+		if result == "client_canceled" {
+			return
+		}
 		s.handleUpstreamError(w, r, err)
 		return
 	}
@@ -94,6 +101,9 @@ func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	count, err := s.runtime.CountTokens(r.Context(), prepared.ModelID, prepared.Body)
 	if err != nil {
 		result = completionResult(err)
+		if result == "client_canceled" {
+			return
+		}
 		s.handleUpstreamError(w, r, err)
 		return
 	}

@@ -153,6 +153,7 @@ start_gateway() {
   echo "网关进程已启动，但健康检查未在限定时间内通过: $(health_url)" >&2
   tail -n 20 "${LOG_FILE}" >&2 || true
   kill -TERM "${pid}" 2>/dev/null || true
+  wait "${pid}" 2>/dev/null || true
   rm -f "${PID_FILE}"
   return 1
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -21,6 +22,8 @@ const (
 type contextKey string
 
 const requestIDContextKey contextKey = "request-id"
+
+var errStreamQueueTimeout = errors.New("等待流式并发槽位超时")
 
 type Server struct {
 	apiKey                  string
@@ -62,16 +65,16 @@ func NewServer(
 	return server
 }
 
-func (s *Server) acquireStream(ctx context.Context) bool {
+func (s *Server) acquireStream(ctx context.Context) error {
 	timer := time.NewTimer(s.streamQueueTimeout)
 	defer timer.Stop()
 	select {
 	case s.streamSlots <- struct{}{}:
-		return true
+		return nil
 	case <-ctx.Done():
-		return false
+		return ctx.Err()
 	case <-timer.C:
-		return false
+		return errStreamQueueTimeout
 	}
 }
 

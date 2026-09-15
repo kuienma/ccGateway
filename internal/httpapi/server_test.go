@@ -42,6 +42,56 @@ type blockingRuntime struct {
 	once    sync.Once
 }
 
+type delayedCancelRuntime struct {
+	runtimeStub
+	started        chan struct{}
+	cancelObserved chan struct{}
+	allowExit      chan struct{}
+	mu             sync.Mutex
+	calls          int
+}
+
+func (r *delayedCancelRuntime) Stream(ctx context.Context, _ string, _ []byte, _ func([]byte) error) error {
+	r.mu.Lock()
+	r.calls++
+	call := r.calls
+	r.mu.Unlock()
+	if call > 1 {
+		return nil
+	}
+	close(r.started)
+	<-ctx.Done()
+	close(r.cancelObserved)
+	<-r.allowExit
+	return ctx.Err()
+}
+
+func (r *delayedCancelRuntime) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+type pacedStreamRuntime struct {
+	runtimeStub
+	interval time.Duration
+	chunks   int
+}
+
+func (r *pacedStreamRuntime) Stream(ctx context.Context, _ string, _ []byte, emit func([]byte) error) error {
+	for i := 0; i < r.chunks; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(r.interval):
+		}
+		if err := emit([]byte(`{"type":"content_block_delta"}`)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (r *blockingRuntime) Stream(ctx context.Context, modelID string, body []byte, _ func([]byte) error) error {
 	r.modelID = modelID
 	r.body = append([]byte(nil), body...)
@@ -230,6 +280,24 @@ func TestStreamSendsHeartbeatWhileWaitingForBedrock(t *testing.T) {
 	}
 }
 
+func TestStreamHeartbeatOnlyFiresWhileIdle(t *testing.T) {
+	t.Parallel()
+
+	runtime := &pacedStreamRuntime{interval: 5 * time.Millisecond, chunks: 5}
+	server := NewServer(
+		testGatewayKey, 1<<20, resolverStub{"opus-5": "model-id"}, runtime,
+		discardLogger(), 20*time.Millisecond, 1, 20*time.Millisecond,
+	)
+	response := performRequest(
+		server, http.MethodPost, "/v1/messages",
+		[]byte(`{"model":"opus-5","max_tokens":1,"messages":[],"stream":true}`),
+		map[string]string{"x-api-key": testGatewayKey},
+	)
+	if strings.Contains(response.Body.String(), ": ping\n\n") {
+		t.Fatalf("持续收到上游事件时不应发送心跳: %q", response.Body.String())
+	}
+}
+
 func TestStreamReturnsOverloadedWhenConcurrencySlotIsBusy(t *testing.T) {
 	t.Parallel()
 
@@ -293,6 +361,138 @@ func TestStreamLogsClientCancellation(t *testing.T) {
 
 	if !strings.Contains(logs.String(), `"result":"client_canceled"`) {
 		t.Fatalf("日志未标记客户端取消: %s", logs.String())
+	}
+}
+
+func TestStreamSlotRemainsOccupiedUntilRuntimeExits(t *testing.T) {
+	t.Parallel()
+
+	runtime := &delayedCancelRuntime{
+		started: make(chan struct{}), cancelObserved: make(chan struct{}), allowExit: make(chan struct{}),
+	}
+	server := NewServer(
+		testGatewayKey, 1<<20, resolverStub{"opus-5": "model-id"}, runtime,
+		discardLogger(), time.Hour, 1, 5*time.Millisecond,
+	)
+	body := []byte(`{"model":"opus-5","max_tokens":1,"messages":[],"stream":true}`)
+	ctx, cancel := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body)).WithContext(ctx)
+	request.Header.Set("x-api-key", testGatewayKey)
+	firstDone := make(chan struct{})
+	go func() {
+		server.Handler().ServeHTTP(httptest.NewRecorder(), request)
+		close(firstDone)
+	}()
+	<-runtime.started
+	cancel()
+	<-runtime.cancelObserved
+
+	second := performRequest(server, http.MethodPost, "/v1/messages", body, map[string]string{"x-api-key": testGatewayKey})
+	if second.Code != http.StatusServiceUnavailable {
+		t.Fatalf("runtime 尚未退出时第二个请求 status = %d, body = %s", second.Code, second.Body.String())
+	}
+	if calls := runtime.callCount(); calls != 1 {
+		t.Fatalf("runtime 调用次数 = %d，槽位提前释放", calls)
+	}
+	close(runtime.allowExit)
+	<-firstDone
+}
+
+func TestCanceledWhileWaitingForStreamSlotIsNotOverloaded(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	runtime := &blockingRuntime{started: make(chan struct{}), release: make(chan struct{})}
+	server := NewServer(
+		testGatewayKey, 1<<20, resolverStub{"opus-5": "model-id"}, runtime,
+		slog.New(slog.NewJSONHandler(&logs, nil)), time.Hour, 1, time.Second,
+	)
+	body := []byte(`{"model":"opus-5","max_tokens":1,"messages":[],"stream":true}`)
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		firstDone <- performRequest(server, http.MethodPost, "/v1/messages", body, map[string]string{"x-api-key": testGatewayKey})
+	}()
+	<-runtime.started
+
+	ctx, cancel := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body)).WithContext(ctx)
+	request.Header.Set("x-api-key", testGatewayKey)
+	cancel()
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if strings.Contains(response.Body.String(), "overloaded_error") {
+		t.Fatalf("客户端取消不应返回 overloaded: %s", response.Body.String())
+	}
+	if !strings.Contains(logs.String(), `"result":"client_canceled"`) {
+		t.Fatalf("日志未标记客户端取消: %s", logs.String())
+	}
+	close(runtime.release)
+	<-firstDone
+}
+
+func TestNonStreamingClientCancellationDoesNotWriteGatewayError(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	server := NewServer(
+		testGatewayKey, 1<<20, resolverStub{"opus-5": "model-id"},
+		&runtimeStub{err: context.Canceled}, slog.New(slog.NewJSONHandler(&logs, nil)),
+		time.Hour, 1, time.Second,
+	)
+	response := performRequest(
+		server, http.MethodPost, "/v1/messages",
+		[]byte(`{"model":"opus-5","max_tokens":1,"messages":[]}`),
+		map[string]string{"x-api-key": testGatewayKey},
+	)
+	if response.Body.Len() != 0 {
+		t.Fatalf("客户端取消后不应写错误响应: %s", response.Body.String())
+	}
+	if strings.Contains(logs.String(), `"level":"ERROR"`) || !strings.Contains(logs.String(), `"result":"client_canceled"`) {
+		t.Fatalf("客户端取消日志级别或结果错误: %s", logs.String())
+	}
+}
+
+func TestCountTokensClientCancellationDoesNotWriteGatewayError(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	server := NewServer(
+		testGatewayKey, 1<<20, resolverStub{"opus-5": "model-id"},
+		&runtimeStub{err: context.Canceled}, slog.New(slog.NewJSONHandler(&logs, nil)),
+		time.Hour, 1, time.Second,
+	)
+	response := performRequest(
+		server, http.MethodPost, "/v1/messages/count_tokens",
+		[]byte(`{"model":"opus-5","messages":[]}`),
+		map[string]string{"x-api-key": testGatewayKey},
+	)
+	if response.Body.Len() != 0 {
+		t.Fatalf("客户端取消后不应写错误响应: %s", response.Body.String())
+	}
+	if strings.Contains(logs.String(), `"level":"ERROR"`) || !strings.Contains(logs.String(), `"result":"client_canceled"`) {
+		t.Fatalf("客户端取消日志级别或结果错误: %s", logs.String())
+	}
+}
+
+func TestNonStreamingUpstreamFailureWritesAndLogsGatewayError(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	server := NewServer(
+		testGatewayKey, 1<<20, resolverStub{"opus-5": "model-id"},
+		&runtimeStub{err: errors.New("upstream reset")}, slog.New(slog.NewJSONHandler(&logs, nil)),
+		time.Hour, 1, time.Second,
+	)
+	response := performRequest(
+		server, http.MethodPost, "/v1/messages",
+		[]byte(`{"model":"opus-5","max_tokens":1,"messages":[]}`),
+		map[string]string{"x-api-key": testGatewayKey},
+	)
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(logs.String(), `"level":"ERROR"`) || !strings.Contains(logs.String(), `"result":"upstream_error"`) {
+		t.Fatalf("上游失败日志级别或结果错误: %s", logs.String())
 	}
 }
 

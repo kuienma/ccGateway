@@ -4,12 +4,14 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 )
 
 func TestNewHTTPClientAppliesBoundedConnectionSettings(t *testing.T) {
 	t.Parallel()
 
-	client := NewHTTPClient()
+	client := newBuildableHTTPClient()
 	dialer := client.GetDialer()
 	transport := client.GetTransport()
 
@@ -19,7 +21,7 @@ func TestNewHTTPClientAppliesBoundedConnectionSettings(t *testing.T) {
 	if transport.TLSHandshakeTimeout != 10*time.Second {
 		t.Fatalf("TLSHandshakeTimeout = %s", transport.TLSHandshakeTimeout)
 	}
-	if transport.ResponseHeaderTimeout != 120*time.Second {
+	if transport.ResponseHeaderTimeout != 0 {
 		t.Fatalf("ResponseHeaderTimeout = %s", transport.ResponseHeaderTimeout)
 	}
 	if transport.IdleConnTimeout != 90*time.Second {
@@ -30,6 +32,14 @@ func TestNewHTTPClientAppliesBoundedConnectionSettings(t *testing.T) {
 	}
 	if client.GetTimeout() != 0 {
 		t.Fatalf("流式 HTTP Client 不应设置总超时: %s", client.GetTimeout())
+	}
+}
+
+func TestNewHTTPClientReturnsFrozenClient(t *testing.T) {
+	t.Parallel()
+
+	if _, mutable := NewHTTPClient().(*awshttp.BuildableClient); mutable {
+		t.Fatal("NewHTTPClient 不应返回可被 AWS defaults mode 重写的 BuildableClient")
 	}
 }
 

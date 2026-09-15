@@ -42,15 +42,16 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, prepared a
 		})
 	}()
 
-	ticker := time.NewTicker(s.streamHeartbeatInterval)
-	defer ticker.Stop()
+	heartbeat := time.NewTimer(s.streamHeartbeatInterval)
+	defer heartbeat.Stop()
 	for {
 		select {
 		case chunk := <-chunks:
 			if err := writeStreamChunk(w, flusher, chunk); err != nil {
 				s.logger.Error("写出流事件失败", "request_id", requestID(r.Context()), "error", err)
-				return err
+				return stopAndWaitForStream(cancel, streamDone, err)
 			}
+			resetTimer(heartbeat, s.streamHeartbeatInterval)
 		case err := <-streamDone:
 			if err != nil {
 				if !errors.Is(err, context.Canceled) {
@@ -58,16 +59,33 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, prepared a
 				}
 			}
 			return err
-		case <-ticker.C:
+		case <-heartbeat.C:
 			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
 				s.logger.Error("写出 SSE 心跳失败", "request_id", requestID(r.Context()), "error", err)
-				return err
+				return stopAndWaitForStream(cancel, streamDone, err)
 			}
 			flusher.Flush()
+			heartbeat.Reset(s.streamHeartbeatInterval)
 		case <-ctx.Done():
-			return ctx.Err()
+			return stopAndWaitForStream(cancel, streamDone, ctx.Err())
 		}
 	}
+}
+
+func stopAndWaitForStream(cancel context.CancelFunc, streamDone <-chan error, result error) error {
+	cancel()
+	<-streamDone
+	return result
+}
+
+func resetTimer(timer *time.Timer, interval time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(interval)
 }
 
 func writeStreamChunk(w http.ResponseWriter, flusher http.Flusher, chunk []byte) error {

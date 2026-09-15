@@ -57,12 +57,12 @@
 - Create: `cmd/gateway/main.go`（修正原 `gateway` 忽略规则后纳入版本控制）
 
 **Interfaces:**
-- Produces: `NewHTTPClient() *awshttp.BuildableClient` 和 `NewRetryer() aws.Retryer`
+- Produces: `NewHTTPClient() aws.HTTPClient`（冻结配置）和 `NewRetryer() aws.Retryer`
 
 - [ ] 添加行为测试：慢建连受 Dial timeout 限制；重试器 `MaxAttempts()==3`。
 - [ ] 运行 `go test ./internal/bedrock -run 'HTTPClient|Retryer' -count=1`，确认缺少接口而失败。
 - [ ] 将 `.gitignore` 的 `gateway` 改为 `/gateway`，把现有 `cmd/gateway/main.go` 纳入版本控制。
-- [ ] 用 `awshttp.NewBuildableClient` 配置 Dial 10 秒、KeepAlive 30 秒、TLS 10 秒、ResponseHeader 120 秒、IdleConn 90 秒、MaxIdle 100、PerHost 20；用 `retry.AddWithMaxBackoffDelay` 限制为 5 秒。
+- [ ] 用 `awshttp.NewBuildableClient` 配置 Dial 10 秒、KeepAlive 30 秒、TLS 10 秒、IdleConn 90 秒、MaxIdle 100、PerHost 20，冻结后交给 AWS SDK；响应头不设置固定超时。用 `retry.AddWithMaxBackoffDelay` 限制为 5 秒。
 - [ ] 在 `LoadDefaultConfig` 中注入 HTTP Client 和每次创建的新 Retryer。
 - [ ] 运行 Bedrock 包测试并确认通过。
 
