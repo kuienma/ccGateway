@@ -134,6 +134,44 @@ func TestMessagesAcceptsAPIKeyAndForwardsNonStreamingResponse(t *testing.T) {
 	}
 }
 
+func TestMessagesLogsCompletionFields(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	runtime := &runtimeStub{response: []byte(`{"type":"message","content":[]}`)}
+	server := NewServer(
+		testGatewayKey,
+		1<<20,
+		resolverStub{"opus-5": "model-id"},
+		runtime,
+		slog.New(slog.NewJSONHandler(&logs, nil)),
+		time.Hour,
+		4,
+		time.Second,
+	)
+	response := performRequest(
+		server,
+		http.MethodPost,
+		"/v1/messages",
+		[]byte(`{"model":"opus-5","max_tokens":1,"messages":[]}`),
+		map[string]string{"x-api-key": testGatewayKey},
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d", response.Code)
+	}
+	for _, expected := range []string{
+		`"operation":"messages"`,
+		`"model_id":"model-id"`,
+		`"stream":false`,
+		`"result":"success"`,
+		`"duration_ms":`,
+	} {
+		if !strings.Contains(logs.String(), expected) {
+			t.Fatalf("日志缺少 %s: %s", expected, logs.String())
+		}
+	}
+}
+
 func TestMessagesAcceptsBearerTokenAndStreamsSSE(t *testing.T) {
 	t.Parallel()
 
@@ -222,6 +260,42 @@ func TestStreamReturnsOverloadedWhenConcurrencySlotIsBusy(t *testing.T) {
 	<-firstDone
 }
 
+func TestStreamLogsClientCancellation(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	runtime := &blockingRuntime{started: make(chan struct{}), release: make(chan struct{})}
+	server := NewServer(
+		testGatewayKey,
+		1<<20,
+		resolverStub{"opus-5": "model-id"},
+		runtime,
+		slog.New(slog.NewJSONHandler(&logs, nil)),
+		time.Hour,
+		1,
+		time.Second,
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/messages",
+		strings.NewReader(`{"model":"opus-5","max_tokens":1,"messages":[],"stream":true}`),
+	).WithContext(ctx)
+	request.Header.Set("x-api-key", testGatewayKey)
+	done := make(chan struct{})
+	go func() {
+		server.Handler().ServeHTTP(httptest.NewRecorder(), request)
+		close(done)
+	}()
+	<-runtime.started
+	cancel()
+	<-done
+
+	if !strings.Contains(logs.String(), `"result":"client_canceled"`) {
+		t.Fatalf("日志未标记客户端取消: %s", logs.String())
+	}
+}
+
 func TestCountTokensUsesBedrockResult(t *testing.T) {
 	t.Parallel()
 
@@ -236,6 +310,42 @@ func TestCountTokensUsesBedrockResult(t *testing.T) {
 	}
 	if runtime.modelID != "global.anthropic.claude-opus-4-8" {
 		t.Fatalf("modelID = %q", runtime.modelID)
+	}
+}
+
+func TestCountTokensLogsCompletionFields(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	server := NewServer(
+		testGatewayKey,
+		1<<20,
+		resolverStub{"opus-5": "model-id"},
+		&runtimeStub{tokenCount: 12},
+		slog.New(slog.NewJSONHandler(&logs, nil)),
+		time.Hour,
+		4,
+		time.Second,
+	)
+	response := performRequest(
+		server,
+		http.MethodPost,
+		"/v1/messages/count_tokens",
+		[]byte(`{"model":"opus-5","messages":[]}`),
+		map[string]string{"x-api-key": testGatewayKey},
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d", response.Code)
+	}
+	for _, expected := range []string{
+		`"operation":"count_tokens"`,
+		`"model_id":"model-id"`,
+		`"result":"success"`,
+		`"duration_ms":`,
+	} {
+		if !strings.Contains(logs.String(), expected) {
+			t.Fatalf("日志缺少 %s: %s", expected, logs.String())
+		}
 	}
 }
 

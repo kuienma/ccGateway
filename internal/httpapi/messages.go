@@ -1,35 +1,58 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/anthropic"
 )
 
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
+	startedAt := time.Now()
+	modelID := ""
+	stream := false
+	result := "rejected"
+	defer func() {
+		s.logger.Info(
+			"请求完成",
+			"request_id", requestID(r.Context()),
+			"operation", "messages",
+			"model_id", modelID,
+			"stream", stream,
+			"duration_ms", time.Since(startedAt).Milliseconds(),
+			"result", result,
+		)
+	}()
+
 	prepared, ok := s.prepare(w, r)
 	if !ok {
 		return
 	}
+	modelID = prepared.ModelID
+	stream = prepared.Stream
 	if prepared.Stream {
 		if !s.acquireStream(r.Context()) {
+			result = "overloaded"
 			s.writeError(w, r, http.StatusServiceUnavailable, anthropic.ErrorTypeOverloaded, "流式请求并发已满")
 			return
 		}
 		defer s.releaseStream()
-		s.handleStream(w, r, prepared)
+		result = completionResult(s.handleStream(w, r, prepared))
 		return
 	}
 
 	response, err := s.runtime.Invoke(r.Context(), prepared.ModelID, prepared.Body)
 	if err != nil {
+		result = completionResult(err)
 		s.handleUpstreamError(w, r, err)
 		return
 	}
+	result = "success"
 	w.Header().Set("Content-Type", contentTypeJSON)
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write(response); err != nil {
@@ -37,16 +60,44 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func completionResult(err error) string {
+	if err == nil {
+		return "success"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "client_canceled"
+	}
+	return "upstream_error"
+}
+
 func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
+	startedAt := time.Now()
+	modelID := ""
+	result := "rejected"
+	defer func() {
+		s.logger.Info(
+			"请求完成",
+			"request_id", requestID(r.Context()),
+			"operation", "count_tokens",
+			"model_id", modelID,
+			"stream", false,
+			"duration_ms", time.Since(startedAt).Milliseconds(),
+			"result", result,
+		)
+	}()
+
 	prepared, ok := s.prepare(w, r)
 	if !ok {
 		return
 	}
+	modelID = prepared.ModelID
 	count, err := s.runtime.CountTokens(r.Context(), prepared.ModelID, prepared.Body)
 	if err != nil {
+		result = completionResult(err)
 		s.handleUpstreamError(w, r, err)
 		return
 	}
+	result = "success"
 	writeJSON(w, http.StatusOK, map[string]int32{"input_tokens": count})
 }
 

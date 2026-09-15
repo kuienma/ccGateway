@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -12,11 +13,11 @@ import (
 
 const contentTypeEventStream = "text/event-stream"
 
-func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, prepared anthropic.PreparedRequest) {
+func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, prepared anthropic.PreparedRequest) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		s.writeError(w, r, http.StatusInternalServerError, anthropic.ErrorTypeAPI, "当前 HTTP 服务不支持流式响应")
-		return
+		return fmt.Errorf("当前 HTTP 服务不支持流式响应")
 	}
 
 	w.Header().Set("Content-Type", contentTypeEventStream)
@@ -48,21 +49,23 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, prepared a
 		case chunk := <-chunks:
 			if err := writeStreamChunk(w, flusher, chunk); err != nil {
 				s.logger.Error("写出流事件失败", "request_id", requestID(r.Context()), "error", err)
-				return
+				return err
 			}
 		case err := <-streamDone:
 			if err != nil {
-				s.writeStreamError(w, r, flusher, err)
+				if !errors.Is(err, context.Canceled) {
+					s.writeStreamError(w, r, flusher, err)
+				}
 			}
-			return
+			return err
 		case <-ticker.C:
 			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
 				s.logger.Error("写出 SSE 心跳失败", "request_id", requestID(r.Context()), "error", err)
-				return
+				return err
 			}
 			flusher.Flush()
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		}
 	}
 }
