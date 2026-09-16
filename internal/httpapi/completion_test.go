@@ -35,9 +35,8 @@ func TestCompletionLogAcrossEndpoints(t *testing.T) {
 			t.Run(endpoint.operation+"/"+tc.name, func(t *testing.T) {
 				t.Parallel()
 				var logs bytes.Buffer
-				server := NewServer(testGatewayKey, 1<<20, resolverStub{"opus-5": "model-id"},
-					&runtimeStub{response: []byte(`{"type":"message"}`), tokenCount: 12, err: tc.err},
-					slog.New(slog.NewJSONHandler(&logs, nil)), time.Hour, 1, time.Second)
+				server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1 << 20, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 1, StreamQueueTimeout: time.Second},
+					resolverStub{"opus-5": "model-id"}, &runtimeStub{response: []byte(`{"type":"message"}`), tokenCount: 12, err: tc.err}, slog.New(slog.NewJSONHandler(&logs, nil)))
 				response := performRequest(server, http.MethodPost, endpoint.path, []byte(tc.body), map[string]string{"x-api-key": testGatewayKey})
 				if response.Code != tc.status {
 					t.Fatalf("status = %d, want %d", response.Code, tc.status)

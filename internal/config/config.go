@@ -55,40 +55,23 @@ func LoadFromLookup(lookup LookupFunc) (Config, error) {
 	if cfg.GatewayAPIKey == "" {
 		return Config{}, fmt.Errorf("GATEWAY_API_KEY 不能为空")
 	}
-	if raw := strings.TrimSpace(value(lookup, "MAX_BODY_BYTES")); raw != "" {
-		parsed, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil || parsed <= 0 {
-			return Config{}, fmt.Errorf("MAX_BODY_BYTES 必须是正整数")
-		}
-		cfg.MaxBodyBytes = parsed
+	var err error
+	if cfg.MaxBodyBytes, err = positiveInteger(lookup, "MAX_BODY_BYTES", cfg.MaxBodyBytes, 64); err != nil {
+		return Config{}, err
 	}
-	if raw := strings.TrimSpace(value(lookup, "SHUTDOWN_TIMEOUT")); raw != "" {
-		parsed, err := time.ParseDuration(raw)
-		if err != nil || parsed <= 0 {
-			return Config{}, fmt.Errorf("SHUTDOWN_TIMEOUT 必须是正 duration")
-		}
-		cfg.ShutdownTimeout = parsed
+	if cfg.ShutdownTimeout, err = positiveDuration(lookup, "SHUTDOWN_TIMEOUT", cfg.ShutdownTimeout); err != nil {
+		return Config{}, err
 	}
-	if raw := strings.TrimSpace(value(lookup, "STREAM_HEARTBEAT_INTERVAL")); raw != "" {
-		parsed, err := time.ParseDuration(raw)
-		if err != nil || parsed <= 0 {
-			return Config{}, fmt.Errorf("STREAM_HEARTBEAT_INTERVAL 必须是正 duration")
-		}
-		cfg.StreamHeartbeatInterval = parsed
+	if cfg.StreamHeartbeatInterval, err = positiveDuration(lookup, "STREAM_HEARTBEAT_INTERVAL", cfg.StreamHeartbeatInterval); err != nil {
+		return Config{}, err
 	}
-	if raw := strings.TrimSpace(value(lookup, "MAX_CONCURRENT_STREAMS")); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed <= 0 {
-			return Config{}, fmt.Errorf("MAX_CONCURRENT_STREAMS 必须是正整数")
-		}
-		cfg.MaxConcurrentStreams = parsed
+	streams, err := positiveInteger(lookup, "MAX_CONCURRENT_STREAMS", int64(cfg.MaxConcurrentStreams), strconv.IntSize)
+	if err != nil {
+		return Config{}, err
 	}
-	if raw := strings.TrimSpace(value(lookup, "STREAM_QUEUE_TIMEOUT")); raw != "" {
-		parsed, err := time.ParseDuration(raw)
-		if err != nil || parsed <= 0 {
-			return Config{}, fmt.Errorf("STREAM_QUEUE_TIMEOUT 必须是正 duration")
-		}
-		cfg.StreamQueueTimeout = parsed
+	cfg.MaxConcurrentStreams = int(streams)
+	if cfg.StreamQueueTimeout, err = positiveDuration(lookup, "STREAM_QUEUE_TIMEOUT", cfg.StreamQueueTimeout); err != nil {
+		return Config{}, err
 	}
 	return cfg, nil
 }
@@ -111,4 +94,29 @@ func valueOrDefault(lookup LookupFunc, key, fallback string) string {
 		return fallback
 	}
 	return result
+}
+
+// bitSize 保留 int 与 int64 配置各自的溢出边界。
+func positiveInteger(lookup LookupFunc, key string, fallback int64, bitSize int) (int64, error) {
+	raw := strings.TrimSpace(value(lookup, key))
+	if raw == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseInt(raw, 10, bitSize)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("%s 必须是正整数", key)
+	}
+	return parsed, nil
+}
+
+func positiveDuration(lookup LookupFunc, key string, fallback time.Duration) (time.Duration, error) {
+	raw := strings.TrimSpace(value(lookup, key))
+	if raw == "" {
+		return fallback, nil
+	}
+	parsed, err := time.ParseDuration(raw)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("%s 必须是正 duration", key)
+	}
+	return parsed, nil
 }

@@ -11,8 +11,8 @@ Spec: docs/design/2026-09-10-bedrock-anthropic-gateway.md
 ## 全局约束
 
 - 不记录提示词、响应正文、AWS 凭证或网关密钥。
-- GATEWAY_API_KEY 与 AWS_REGION 缺失时启动失败。
-- 模型只允许 Global Opus 5 和 Global Opus 4.8。
+- GATEWAY_API_KEY 缺失，或 AWS_REGION 与 AWS_DEFAULT_REGION 均为空时启动失败。
+- 历史约束（已被动态模型目录替代）：初始目录包含 Global Opus 5 和 Global Opus 4.8；当前允许 MODEL_CONFIG_FILE 中登记的任意模型，不使用固定白名单。
 - 生产代码文件控制在 500 行内。
 - 所有行为先写失败测试，再写最小实现。
 

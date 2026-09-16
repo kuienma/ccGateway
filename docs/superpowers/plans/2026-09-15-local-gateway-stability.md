@@ -1,5 +1,7 @@
 # Local Gateway Stability Implementation Plan
 
+> 历史计划：未勾选项不代表当前未实现。2026-09-16 已逐项对照实现；本轮有效清单见 `2026-09-16-project-refactor.md`。下列部署、重启和真实 AWS 调用仍需单独授权，本轮不执行。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 提升必须经过本机 Mihomo 代理访问 Bedrock 时的请求成功率、超时可控性和运行可观测性。

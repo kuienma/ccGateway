@@ -21,25 +21,25 @@ type Server struct {
 	streamSlots             chan struct{}
 }
 
-func NewServer(
-	apiKey string,
-	maxBodyBytes int64,
-	resolver anthropic.ModelResolver,
-	runtime bedrock.Runtime,
-	logger *slog.Logger,
-	streamHeartbeatInterval time.Duration,
-	maxConcurrentStreams int,
-	streamQueueTimeout time.Duration,
-) *Server {
+// ServerConfig 仅包含 HTTP 层使用的基础配置，运行依赖单独注入。
+type ServerConfig struct {
+	APIKey                  string
+	MaxBodyBytes            int64
+	StreamHeartbeatInterval time.Duration
+	MaxConcurrentStreams    int
+	StreamQueueTimeout      time.Duration
+}
+
+func NewServer(cfg ServerConfig, resolver anthropic.ModelResolver, runtime bedrock.Runtime, logger *slog.Logger) *Server {
 	server := &Server{
-		apiKey:                  apiKey,
-		maxBodyBytes:            maxBodyBytes,
+		apiKey:                  cfg.APIKey,
+		maxBodyBytes:            cfg.MaxBodyBytes,
 		resolver:                resolver,
 		runtime:                 runtime,
 		logger:                  logger,
-		streamHeartbeatInterval: streamHeartbeatInterval,
-		streamQueueTimeout:      streamQueueTimeout,
-		streamSlots:             make(chan struct{}, maxConcurrentStreams),
+		streamHeartbeatInterval: cfg.StreamHeartbeatInterval,
+		streamQueueTimeout:      cfg.StreamQueueTimeout,
+		streamSlots:             make(chan struct{}, cfg.MaxConcurrentStreams),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", server.handleHealth)

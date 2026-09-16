@@ -55,21 +55,33 @@ func (c *Client) Stream(ctx context.Context, modelID string, body []byte, emit f
 		return fmt.Errorf("调用 Bedrock InvokeModelWithResponseStream: %w", err)
 	}
 
-	stream := output.GetStream()
+	return consumeStream(ctx, output.GetStream(), emit)
+}
+
+// consumeStream 持有 SDK 流，所有退出路径都关闭其 reader。
+func consumeStream(ctx context.Context, stream *bedrockruntime.InvokeModelWithResponseStreamEventStream, emit func([]byte) error) error {
 	defer stream.Close()
-	for event := range stream.Events() {
-		chunk, ok := event.(*brtypes.ResponseStreamMemberChunk)
-		if !ok {
-			continue
-		}
-		if err := emit(chunk.Value.Bytes); err != nil {
-			return fmt.Errorf("写出流事件: %w", err)
+	events := stream.Events()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case event, ok := <-events:
+			if !ok {
+				if err := stream.Err(); err != nil {
+					return fmt.Errorf("读取 Bedrock 流事件: %w", err)
+				}
+				return ctx.Err()
+			}
+			chunk, ok := event.(*brtypes.ResponseStreamMemberChunk)
+			if !ok {
+				continue
+			}
+			if err := emit(chunk.Value.Bytes); err != nil {
+				return fmt.Errorf("写出流事件: %w", err)
+			}
 		}
 	}
-	if err := stream.Err(); err != nil {
-		return fmt.Errorf("读取 Bedrock 流事件: %w", err)
-	}
-	return nil
 }
 
 func (c *Client) CountTokens(ctx context.Context, modelID string, body []byte) (int32, error) {
