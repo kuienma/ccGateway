@@ -15,7 +15,7 @@
 | `opus-5`、`claude-opus-5` | `global.anthropic.claude-opus-5` |
 | `opus-4-8`、`claude-opus-4-8` | `global.anthropic.claude-opus-4-8` |
 
-完整 Bedrock model ID 也可以直接作为客户端模型名。未登记的模型会返回 `not_found_error`。
+目录中登记的完整 Bedrock model ID 也可以直接作为客户端模型名。未登记的模型会返回 `not_found_error`。
 
 ## 启动
 
@@ -63,7 +63,7 @@ MAX_CONCURRENT_STREAMS=4      # 同时执行的 Bedrock 流式请求数
 STREAM_QUEUE_TIMEOUT=30s      # 等待流式并发槽位的最长时间
 ```
 
-网关在 Bedrock 暂无新事件时发送 `: ping` SSE 注释；每收到一个上游事件都会重新计算空闲时间，客户端应忽略注释。并发槽位在等待超时后返回 `503 overloaded_error`。AWS SDK 使用 10 秒建连超时、30 秒 TCP keepalive、120 秒响应头超时和最多三次重试，单次最大退避限制为 5 秒；流式响应不设置覆盖整个生成过程的总超时。
+网关在 Bedrock 暂无新事件时发送 `: ping` SSE 注释；每收到一个上游事件都会重新计算空闲时间，客户端应忽略注释。并发槽位在等待超时后返回 `503 overloaded_error`。AWS SDK 使用 10 秒建连超时、30 秒 TCP keepalive、120 秒响应头超时和最多三次调用尝试（含首次调用），单次最大退避限制为 5 秒；流式响应不设置覆盖整个生成过程的总超时。
 
 Clash Verge Rev / Mihomo 建议为 Bedrock 域名配置固定的支持地区节点，并启用：
 
@@ -127,14 +127,26 @@ docker run --rm -p 8080:8080 \
 
 本地 Docker 可在已被 .gitignore 排除的 .env 中提供 AWS 默认凭证链需要的变量。部署在 AWS 时应给容器绑定 IAM Role，不向镜像写入静态 AWS 凭证。该 Role 至少需要目标模型对应的 bedrock:InvokeModel、bedrock:InvokeModelWithResponseStream 与 bedrock:CountTokens 权限。
 
+## 模块职责与生命周期
+
+- `cmd/gateway/main.go` 是日志与进程退出入口；`app.go` 装配配置、模型目录、AWS 客户端和 HTTP 服务；`lifecycle.go` 管理信号、服务运行及后台任务回收。
+- `internal/config` 解析环境变量；`internal/modelcatalog` 分别负责纯 JSON 校验、模型名解析和文件加载／原子快照替换。
+- `internal/anthropic` 转换协议字段；`internal/bedrock` 负责 SDK 调用、传输策略和流资源关闭；`internal/httpapi` 负责路由、认证、请求准备、SSE、并发槽位及完成日志。
+
+收到 SIGINT、SIGTERM 或父 context 取消后，停止接收新请求；关闭信号不会直接取消所有请求。进入退出流程时取消热更新，HTTP Shutdown 与后台任务清理共用 `SHUTDOWN_TIMEOUT`（默认 `15s`）对应的一个截止时间，期限内等待在途请求与任务正常完成。服务自身失败也使用该期限等待清理。若同步模型文件读取仍阻塞，期限耗尽即返回可由 `errors.Is(err, context.DeadlineExceeded)` 识别的错误，保留原始服务／Shutdown 错误，由 main 的错误路径终止进程；此时不保证全部后台任务已回收。SIGHUP 和退出信号订阅在返回时释放。SDK 流在正常结束、异常、回调失败或取消时关闭，不重放已输出的内容。
+
 ## 验证
 
 ```bash
-go test ./...
-go test -race ./...
-go test -tags=integration ./internal/bedrock # 设置 BEDROCK_INTEGRATION_MODEL 后调用真实 CountTokens
+go test -count=1 ./...
+go test -race -count=1 ./...
 go vet ./...
-CGO_ENABLED=0 GOOS=linux go build -trimpath -o /tmp/bedrock-anthropic-gateway ./cmd/gateway
+bash -n scripts/gateway.sh tests/static/test_gateway_start_check.sh
+bash tests/static/test_gateway_start_check.sh
+build_dir=$(mktemp -d)
+CGO_ENABLED=0 GOOS=linux go build -trimpath -o "$build_dir/gateway" ./cmd/gateway
 ```
 
 请求完成日志记录 request ID、接口、模型、是否流式、耗时和结果；上游失败另记错误详情。日志不记录请求正文、网关密钥或 AWS 凭证。
+
+常规测试使用 stub、临时文件和独立本地监听器，不需要真实 AWS 凭据，也不操作现有服务。真实 AWS 测试由 `integration` build tag 隔离，只有明确需要访问 AWS 时才运行 `go test -tags=integration ./internal/bedrock` 并设置 `BEDROCK_INTEGRATION_MODEL`。

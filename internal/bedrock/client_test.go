@@ -2,6 +2,7 @@ package bedrock
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -83,5 +84,31 @@ func TestClientCountTokensUsesInvokeModelShape(t *testing.T) {
 	member, ok := sdk.countInput.Input.(*brtypes.CountTokensInputMemberInvokeModel)
 	if !ok || string(member.Value.Body) != string(body) {
 		t.Fatalf("CountTokens body 未按 InvokeModel 形态透传: %#v", sdk.countInput.Input)
+	}
+}
+
+type errorSDK struct{ err error }
+
+func (s errorSDK) InvokeModel(context.Context, *bedrockruntime.InvokeModelInput, ...func(*bedrockruntime.Options)) (*bedrockruntime.InvokeModelOutput, error) {
+	return nil, s.err
+}
+func (s errorSDK) InvokeModelWithResponseStream(context.Context, *bedrockruntime.InvokeModelWithResponseStreamInput, ...func(*bedrockruntime.Options)) (*bedrockruntime.InvokeModelWithResponseStreamOutput, error) {
+	return nil, s.err
+}
+func (s errorSDK) CountTokens(context.Context, *bedrockruntime.CountTokensInput, ...func(*bedrockruntime.Options)) (*bedrockruntime.CountTokensOutput, error) {
+	return nil, s.err
+}
+
+func TestClientPreservesSDKErrorIdentity(t *testing.T) {
+	t.Parallel()
+	want := errors.New("SDK failed")
+	client := NewClient(errorSDK{err: want})
+	_, invokeErr := client.Invoke(context.Background(), "model", nil)
+	_, countErr := client.CountTokens(context.Background(), "model", nil)
+	streamErr := client.Stream(context.Background(), "model", nil, func([]byte) error { t.Error("启动失败不应发送事件"); return nil })
+	for _, err := range []error{invokeErr, countErr, streamErr} {
+		if !errors.Is(err, want) {
+			t.Fatalf("SDK 错误身份丢失: %v", err)
+		}
 	}
 }

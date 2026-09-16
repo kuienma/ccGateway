@@ -29,7 +29,7 @@ Token 统计调用 Bedrock CountTokens。若目标模型或区域不支持，返
 - AWS SDK v2 默认凭证链，支持 IAM Role、AWS Profile、SSO 和临时凭证；区域接受 AWS_REGION 或 AWS_DEFAULT_REGION。
 - GATEWAY_API_KEY 必填并使用恒定时间比较。
 - 默认请求体上限 20 MiB。
-- 日志只记录 request ID、HTTP 状态、耗时和 AWS request ID，不记录正文或凭证。
+- 完成日志每个进入 Messages/CountTokens handler 的请求记录一次 request_id、operation、model_id、stream、duration_ms、result；上游错误另记 error，非流式错误同时记录 status，不额外承诺独立 AWS request ID 字段，不记录正文或凭证。
 - 支持 HTTP 超时、客户端取消、优雅退出。
 - Docker 镜像使用非 root 用户运行。
 
@@ -43,3 +43,9 @@ Token 统计调用 Bedrock CountTokens。若目标模型或区域不支持，返
 6. 客户端断开会取消 AWS 请求。
 7. Bedrock 4xx、限流和 5xx转换为 Anthropic 错误。
 8. Go 单测、race、vet、Linux 静态构建及 Docker 构建通过。
+
+## 2026-09-16 职责整理
+
+当前启动装配与生命周期分离在 cmd/gateway/app.go、lifecycle.go；HTTP 基础参数使用 ServerConfig，resolver/runtime/logger 显式注入。模型目录由 parse.go 完整校验、catalog.go 只读解析、manager.go 加载并原子替换。热更新监听具有 context 退出路径。退出时取消热更新，HTTP Shutdown 与后台任务清理共用一个从退出开始计算的超时 context（使用既有 SHUTDOWN_TIMEOUT），保持在途请求的优雅完成语义，不累计多轮超时。期限耗尽返回 DeadlineExceeded 并保留原始服务／Shutdown 错误；同步文件读取可能仍未结束，不能将该路径视为全部任务已回收。所有返回路径均取消信号订阅，由 main 按既有错误退出路径终止进程。
+
+执行与验证结果见 `../reports/2026-09-16-project-refactor.md`。此前设计与计划中的部署、真实 AWS 调用不属于本轮验收范围。

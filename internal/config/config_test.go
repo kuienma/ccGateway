@@ -1,6 +1,8 @@
 package config
 
 import (
+	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -186,4 +188,66 @@ func TestLoadFromLookupRejectsInvalidStabilitySettings(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLoadFromLookupBoundaries(t *testing.T) {
+	t.Parallel()
+	defaults, err := LoadFromLookup(lookupValues(map[string]string{"AWS_REGION": "us-east-1", "GATEWAY_API_KEY": "key"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"MAX_BODY_BYTES", "MAX_CONCURRENT_STREAMS", "SHUTDOWN_TIMEOUT", "STREAM_HEARTBEAT_INTERVAL", "STREAM_QUEUE_TIMEOUT"} {
+		for _, raw := range []string{"", " \t ", "0", "-1", "invalid", "9223372036854775808"} {
+			t.Run(key+"/"+raw, func(t *testing.T) {
+				values := map[string]string{"AWS_REGION": "us-east-1", "GATEWAY_API_KEY": "key", key: raw}
+				cfg, err := LoadFromLookup(lookupValues(values))
+				if strings.TrimSpace(raw) == "" {
+					if err != nil || cfg != defaults {
+						t.Fatalf("空白应使用默认值: %+v %v", cfg, err)
+					}
+				} else {
+					suffix := " 必须是正 duration"
+					if key == "MAX_BODY_BYTES" || key == "MAX_CONCURRENT_STREAMS" {
+						suffix = " 必须是正整数"
+					}
+					if err == nil || err.Error() != key+suffix || cfg != (Config{}) {
+						t.Fatalf("非法值未保留校验语义: %+v %v", cfg, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestLoadFromLookupTrimsAndPrefersAWSRegion(t *testing.T) {
+	t.Parallel()
+	values := map[string]string{
+		"AWS_REGION": " us-east-1 ", "AWS_DEFAULT_REGION": "us-west-2", "GATEWAY_API_KEY": " key ",
+		"LISTEN_ADDR": " :9090 ", "MODEL_CONFIG_FILE": " models.json ", "MAX_BODY_BYTES": " +9223372036854775807 ",
+		"MAX_CONCURRENT_STREAMS": " +2 ", "SHUTDOWN_TIMEOUT": " 1ns ", "STREAM_HEARTBEAT_INTERVAL": " 2m ", "STREAM_QUEUE_TIMEOUT": " 1.5s ",
+	}
+	cfg, err := LoadFromLookup(lookupValues(values))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AWSRegion != "us-east-1" || cfg.GatewayAPIKey != "key" || cfg.ListenAddr != ":9090" || cfg.ModelConfigFile != "models.json" || cfg.MaxBodyBytes != math.MaxInt64 || cfg.MaxConcurrentStreams != 2 || cfg.ShutdownTimeout != time.Nanosecond || cfg.StreamHeartbeatInterval != 2*time.Minute || cfg.StreamQueueTimeout != 1500*time.Millisecond {
+		t.Fatalf("cfg = %+v", cfg)
+	}
+	values["AWS_REGION"] = " \t "
+	cfg, err = LoadFromLookup(lookupValues(values))
+	if err != nil || cfg.AWSRegion != "us-west-2" {
+		t.Fatalf("区域 fallback = %+v %v", cfg, err)
+	}
+	for _, key := range []string{"SHUTDOWN_TIMEOUT", "STREAM_HEARTBEAT_INTERVAL", "STREAM_QUEUE_TIMEOUT"} {
+		for _, raw := range []string{"-1ns", "0s", "9223372036854775808ns"} {
+			copy := map[string]string{"AWS_REGION": "r", "GATEWAY_API_KEY": "k", key: raw}
+			if _, err := LoadFromLookup(lookupValues(copy)); err == nil {
+				t.Fatalf("%s=%q 应被拒绝", key, raw)
+			}
+		}
+	}
+}
+
+func lookupValues(values map[string]string) LookupFunc {
+	return func(key string) (string, bool) { value, ok := values[key]; return value, ok }
 }
