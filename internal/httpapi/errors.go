@@ -9,6 +9,8 @@ import (
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/anthropic"
 )
 
+const errorType = "error"
+
 func (s *Server) writeError(w http.ResponseWriter, r *http.Request, status int, kind, message string) {
 	writeJSON(w, status, anthropic.ErrorEnvelope{
 		Type: errorType,
