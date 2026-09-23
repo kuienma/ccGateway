@@ -244,6 +244,84 @@ func TestBuildRequestThinkingPolicy(t *testing.T) {
 	}
 }
 
+// TestBuildRequestOrdersToolResultsBeforeText 锁定混合形状的排序：
+// OpenAI 要求 role=tool 消息紧跟带 tool_calls 的 assistant 消息，
+// 中间插入 user 消息会打断绑定，所以 tool_result 必须排在同条消息的 text 之前。
+func TestBuildRequestOrdersToolResultsBeforeText(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{
+		"max_tokens": 64,
+		"messages": [
+			{"role": "user", "content": "北京和上海天气"},
+			{"role": "assistant", "content": [
+				{"type": "tool_use", "id": "t1", "name": "get_weather", "input": {"city": "北京"}},
+				{"type": "tool_use", "id": "t2", "name": "get_weather", "input": {"city": "上海"}}
+			]},
+			{"role": "user", "content": [
+				{"type": "tool_result", "tool_use_id": "t1", "content": "北京 18 度"},
+				{"type": "tool_result", "tool_use_id": "t2", "content": "上海 22 度"},
+				{"type": "text", "text": "顺便说说明天"}
+			]}
+		]
+	}`)
+
+	req, rejection := BuildRequest("m", raw, false)
+	if rejection != nil {
+		t.Fatalf("不应被拒绝: %v", rejection)
+	}
+
+	// user + assistant(tool_calls) + tool(t1) + tool(t2) + user(text)
+	if len(req.Messages) != 5 {
+		t.Fatalf("消息数 = %d，期望 5: %#v", len(req.Messages), req.Messages)
+	}
+	if req.Messages[1].Role != "assistant" || len(req.Messages[1].ToolCalls) != 2 {
+		t.Fatalf("Messages[1] 应是带两个 tool_calls 的 assistant，实际 %#v", req.Messages[1])
+	}
+
+	type shape struct {
+		role       string
+		content    string
+		toolCallID string
+	}
+	want := []shape{
+		{"tool", "北京 18 度", "t1"},
+		{"tool", "上海 22 度", "t2"},
+		{"user", "顺便说说明天", ""},
+	}
+	for offset, expected := range want {
+		got := req.Messages[2+offset]
+		actual := shape{got.Role, got.Content, got.ToolCallID}
+		if actual != expected {
+			t.Fatalf("Messages[%d] = %#v，期望 %#v", 2+offset, actual, expected)
+		}
+	}
+}
+
+// TestBuildRequestTrimsToolName 锁定：工具名的非空校验用 trim 后的值，
+// 下发也必须用 trim 后的值。否则模型回吐的 tool name 不带空格，
+// 后续轮次的 tool_use.name 会对不上。
+func TestBuildRequestTrimsToolName(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{
+		"max_tokens": 64,
+		"messages": [{"role": "user", "content": "hi"}],
+		"tools": [{"name": "  get_weather  ", "input_schema": {"type": "object"}}]
+	}`)
+
+	req, rejection := BuildRequest("m", raw, false)
+	if rejection != nil {
+		t.Fatalf("不应被拒绝: %v", rejection)
+	}
+	if len(req.Tools) != 1 {
+		t.Fatalf("工具数 = %d", len(req.Tools))
+	}
+	if req.Tools[0].Function.Name != "get_weather" {
+		t.Fatalf("工具名应去掉首尾空白，实际 %q", req.Tools[0].Function.Name)
+	}
+}
+
 // TestBuildRequestKeepsEmptyContentMessage 锁定裁决 A：内容为空数组的消息不能被丢弃，
 // 否则会破坏 Ark 侧 user/assistant 交替。只有「内容全是 tool_result」时才不产出主消息。
 func TestBuildRequestKeepsEmptyContentMessage(t *testing.T) {

@@ -90,7 +90,10 @@ func BuildRequest(modelID string, anthropicBody []byte, stream bool) (*ChatReque
 	}
 
 	for index, tool := range source.Tools {
-		if strings.TrimSpace(tool.Name) == "" {
+		// 校验与下发用同一个 trim 后的值：模型回吐的 tool name 不会带空白，
+		// 原样下发会让后续轮次的 tool_use.name 对不上。
+		name := strings.TrimSpace(tool.Name)
+		if name == "" {
 			return nil, &Rejection{
 				Kind:    kindInvalidRequest,
 				Message: fmt.Sprintf("tools[%d].name 不能为空", index),
@@ -99,7 +102,7 @@ func BuildRequest(modelID string, anthropicBody []byte, stream bool) (*ChatReque
 		request.Tools = append(request.Tools, Tool{
 			Type: "function",
 			Function: FunctionSpec{
-				Name:        tool.Name,
+				Name:        name,
 				Description: tool.Description,
 				Parameters:  tool.InputSchema,
 			},
@@ -263,7 +266,11 @@ func convertMessage(index int, message anthropicMessage) ([]ChatMessage, *Reject
 		}
 	}
 
-	var converted []ChatMessage
+	// tool_result 拆出的 role=tool 消息必须排在最前：OpenAI 要求它们紧跟带
+	// tool_calls 的 assistant 消息，中间插入一条 user 消息会打断这个绑定。
+	// Anthropic 允许 tool_result 与 text 混在同一条消息里，所以这里要重排。
+	converted := results
+
 	// 有文本或工具调用时产出主消息；内容全是 tool_result 时不产出（已拆成独立的
 	// role=tool 消息）；内容真的为空时仍产出一条空消息，因为丢消息会破坏 Ark 侧
 	// user/assistant 交替，比发一条空消息更危险。
@@ -274,7 +281,7 @@ func convertMessage(index int, message anthropicMessage) ([]ChatMessage, *Reject
 			ToolCalls: toolCalls,
 		})
 	}
-	return append(converted, results...), nil
+	return converted, nil
 }
 
 // flattenText 把 Anthropic 的 content（字符串或块数组）压成单个字符串。
