@@ -9,11 +9,12 @@ import (
 	"time"
 
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/anthropic"
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
 )
 
 const contentTypeEventStream = "text/event-stream"
 
-func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, prepared anthropic.PreparedRequest) error {
+func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, provider llm.Provider, prepared anthropic.PreparedRequest) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		s.writeError(w, r, http.StatusInternalServerError, anthropic.ErrorTypeAPI, "当前 HTTP 服务不支持流式响应")
@@ -31,7 +32,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, prepared a
 	chunks := make(chan []byte)
 	streamDone := make(chan error, 1)
 	go func() {
-		streamDone <- s.runtime.Stream(ctx, prepared.ModelID, prepared.Body, func(chunk []byte) error {
+		streamDone <- provider.Stream(ctx, prepared.ModelID, prepared.Body, func(chunk []byte) error {
 			copied := append([]byte(nil), chunk...)
 			select {
 			case chunks <- copied:

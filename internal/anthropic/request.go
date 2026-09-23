@@ -3,18 +3,21 @@ package anthropic
 import (
 	"encoding/json"
 	"fmt"
+
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
 )
 
 const BedrockAnthropicVersion = "bedrock-2023-05-31"
 
 type ModelResolver interface {
-	Resolve(name string) (string, bool)
+	Resolve(name string) (llm.Resolution, bool)
 }
 
 type PreparedRequest struct {
-	ModelID string
-	Body    []byte
-	Stream  bool
+	ModelID  string
+	Body     []byte
+	Stream   bool
+	Provider string
 }
 
 func PrepareRequest(raw []byte, betaFeatures []string, resolver ModelResolver) (PreparedRequest, *RequestError) {
@@ -27,7 +30,7 @@ func PrepareRequest(raw []byte, betaFeatures []string, resolver ModelResolver) (
 	if requestErr != nil {
 		return PreparedRequest{}, requestErr
 	}
-	modelID, ok := resolver.Resolve(modelName)
+	resolution, ok := resolver.Resolve(modelName)
 	if !ok {
 		return PreparedRequest{}, &RequestError{
 			Kind:    ErrorTypeNotFound,
@@ -42,16 +45,25 @@ func PrepareRequest(raw []byte, betaFeatures []string, resolver ModelResolver) (
 
 	delete(body, "model")
 	delete(body, "stream")
-	body["anthropic_version"] = mustMarshal(BedrockAnthropicVersion)
-	if len(betaFeatures) > 0 {
-		body["anthropic_beta"] = mustMarshal(betaFeatures)
+	// anthropic_version 与 anthropic_beta 是 Bedrock InvokeModel 的入参约定，
+	// 其他 provider 由各自的转换层处理，这里不注入。
+	if resolution.Provider == llm.ProviderBedrock {
+		body["anthropic_version"] = mustMarshal(BedrockAnthropicVersion)
+		if len(betaFeatures) > 0 {
+			body["anthropic_beta"] = mustMarshal(betaFeatures)
+		}
 	}
 
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return PreparedRequest{}, invalidRequest("请求体无法编码")
 	}
-	return PreparedRequest{ModelID: modelID, Body: encoded, Stream: stream}, nil
+	return PreparedRequest{
+		ModelID:  resolution.ModelID,
+		Body:     encoded,
+		Stream:   stream,
+		Provider: resolution.Provider,
+	}, nil
 }
 
 func optionalString(body map[string]json.RawMessage, key string) (string, *RequestError) {

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
 )
 
 func TestMessagesAcceptsAPIKeyAndForwardsNonStreamingResponse(t *testing.T) {
@@ -52,7 +54,7 @@ func TestMessagesLogsCompletionFields(t *testing.T) {
 	var logs bytes.Buffer
 	runtime := &runtimeStub{response: []byte(`{"type":"message","content":[]}`)}
 	server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1 << 20, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 4, StreamQueueTimeout: time.Second},
-		resolverStub{"opus-5": "model-id"}, runtime, slog.New(slog.NewJSONHandler(&logs, nil)))
+		resolverStub{"opus-5": "model-id"}, map[string]llm.Provider{llm.ProviderBedrock: runtime}, slog.New(slog.NewJSONHandler(&logs, nil)))
 	response := performRequest(
 		server,
 		http.MethodPost,
@@ -81,7 +83,7 @@ func TestNonStreamingClientCancellationDoesNotWriteGatewayError(t *testing.T) {
 
 	var logs bytes.Buffer
 	server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1 << 20, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 1, StreamQueueTimeout: time.Second},
-		resolverStub{"opus-5": "model-id"}, &runtimeStub{err: context.Canceled}, slog.New(slog.NewJSONHandler(&logs, nil)))
+		resolverStub{"opus-5": "model-id"}, map[string]llm.Provider{llm.ProviderBedrock: &runtimeStub{err: context.Canceled}}, slog.New(slog.NewJSONHandler(&logs, nil)))
 	response := performRequest(
 		server, http.MethodPost, "/v1/messages",
 		[]byte(`{"model":"opus-5","max_tokens":1,"messages":[]}`),
@@ -100,7 +102,7 @@ func TestNonStreamingUpstreamFailureWritesAndLogsGatewayError(t *testing.T) {
 
 	var logs bytes.Buffer
 	server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1 << 20, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 1, StreamQueueTimeout: time.Second},
-		resolverStub{"opus-5": "model-id"}, &runtimeStub{err: errors.New("upstream reset")}, slog.New(slog.NewJSONHandler(&logs, nil)))
+		resolverStub{"opus-5": "model-id"}, map[string]llm.Provider{llm.ProviderBedrock: &runtimeStub{err: errors.New("upstream reset")}}, slog.New(slog.NewJSONHandler(&logs, nil)))
 	response := performRequest(
 		server, http.MethodPost, "/v1/messages",
 		[]byte(`{"model":"opus-5","max_tokens":1,"messages":[]}`),

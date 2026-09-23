@@ -3,6 +3,8 @@ package httpapi
 import (
 	"net/http"
 	"time"
+
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/anthropic"
 )
 
 func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
@@ -14,7 +16,13 @@ func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	completion.modelID = prepared.ModelID
-	count, err := s.runtime.CountTokens(r.Context(), prepared.ModelID, prepared.Body)
+	provider, ok := s.providerFor(prepared.Provider)
+	if !ok {
+		s.writeError(w, r, http.StatusServiceUnavailable, anthropic.ErrorTypeAPI,
+			"模型所属 provider 未启用: "+prepared.Provider)
+		return
+	}
+	count, err := provider.CountTokens(r.Context(), prepared.ModelID, prepared.Body)
 	if err != nil {
 		completion.result = completionResult(err)
 		if completion.result == "client_canceled" {

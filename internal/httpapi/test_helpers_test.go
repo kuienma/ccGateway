@@ -9,13 +9,20 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
 )
 
 type resolverStub map[string]string
 
-func (r resolverStub) Resolve(name string) (string, bool) {
+// Resolve 把登记的模型名解析为 bedrock provider 下的模型标识，
+// 保持既有用例的字面量写法不变。
+func (r resolverStub) Resolve(name string) (llm.Resolution, bool) {
 	modelID, ok := r[name]
-	return modelID, ok
+	if !ok {
+		return llm.Resolution{}, false
+	}
+	return llm.Resolution{ModelID: modelID, Provider: llm.ProviderBedrock}, true
 }
 
 type runtimeStub struct {
@@ -54,7 +61,7 @@ const testGatewayKey = "test-gateway-key"
 
 func newTestServer(runtime *runtimeStub, resolver resolverStub) *Server {
 	return NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1 << 20, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 4, StreamQueueTimeout: time.Second},
-		resolver, runtime, discardLogger())
+		resolver, map[string]llm.Provider{llm.ProviderBedrock: runtime}, discardLogger())
 }
 
 func discardLogger() *slog.Logger {

@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"reflect"
 	"testing"
+
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
 )
 
-type resolverStub map[string]string
+type resolverStub map[string]llm.Resolution
 
-func (r resolverStub) Resolve(name string) (string, bool) {
+func (r resolverStub) Resolve(name string) (llm.Resolution, bool) {
 	value, ok := r[name]
 	return value, ok
 }
@@ -23,7 +25,7 @@ func TestPrepareRequestPreservesFieldsAndMapsModel(t *testing.T) {
 		"tools": [{"name":"weather","description":"lookup","input_schema":{"type":"object"}}],
 		"stream": true
 	}`)
-	resolver := resolverStub{"opus-5": "global.anthropic.claude-opus-5"}
+	resolver := resolverStub{"opus-5": {ModelID: "global.anthropic.claude-opus-5", Provider: llm.ProviderBedrock}}
 
 	prepared, err := PrepareRequest(raw, []string{"beta-a", "beta-b"}, resolver)
 	if err != nil {
@@ -63,7 +65,7 @@ func TestPrepareRequestPreservesFieldsAndMapsModel(t *testing.T) {
 func TestPrepareRequestUsesDefaultModel(t *testing.T) {
 	t.Parallel()
 
-	resolver := resolverStub{"": "global.anthropic.claude-opus-5"}
+	resolver := resolverStub{"": {ModelID: "global.anthropic.claude-opus-5", Provider: llm.ProviderBedrock}}
 	prepared, err := PrepareRequest([]byte(`{"max_tokens":1,"messages":[]}`), nil, resolver)
 	if err != nil {
 		t.Fatalf("准备请求失败: %v", err)
@@ -82,7 +84,7 @@ func TestPrepareRequestPreservesOutputConfig(t *testing.T) {
 		{"unknown_format", `{"format":{"type":"future_format","option":true}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			prepared, err := PrepareRequest([]byte(`{"model":"opus-5","messages":[],"output_config":`+tc.config+`}`), nil, resolverStub{"opus-5": "model-id"})
+			prepared, err := PrepareRequest([]byte(`{"model":"opus-5","messages":[],"output_config":`+tc.config+`}`), nil, resolverStub{"opus-5": {ModelID: "model-id", Provider: llm.ProviderBedrock}})
 			if err != nil {
 				t.Fatalf("准备请求失败: %v", err)
 			}
@@ -122,9 +124,59 @@ func TestPrepareRequestRejectsInvalidJSONAndStreamType(t *testing.T) {
 		[]byte(`{"model":"opus-5","stream":"yes"}`),
 	}
 	for _, body := range testCases {
-		if _, err := PrepareRequest(body, nil, resolverStub{"opus-5": "model"}); err == nil || err.Kind != ErrorTypeInvalidRequest {
+		if _, err := PrepareRequest(body, nil, resolverStub{"opus-5": {ModelID: "model", Provider: llm.ProviderBedrock}}); err == nil || err.Kind != ErrorTypeInvalidRequest {
 			t.Fatalf("预期 invalid_request_error，得到 %#v", err)
 		}
+	}
+}
+
+func TestPrepareRequestSkipsAnthropicVersionForArk(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{"model":"ds-flash","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`)
+	resolver := resolverStub{"ds-flash": {ModelID: "deepseek-v4-flash-ga-260731", Provider: llm.ProviderArk}}
+
+	prepared, err := PrepareRequest(raw, nil, resolver)
+	if err != nil {
+		t.Fatalf("准备请求失败: %v", err)
+	}
+	if prepared.Provider != llm.ProviderArk {
+		t.Fatalf("Provider = %q，期望 ark", prepared.Provider)
+	}
+
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(prepared.Body, &body); err != nil {
+		t.Fatalf("解析 body 失败: %v", err)
+	}
+	if _, exists := body["anthropic_version"]; exists {
+		t.Fatal("ark 路径不应注入 anthropic_version")
+	}
+	if _, exists := body["model"]; exists {
+		t.Fatal("body 不应包含 model")
+	}
+}
+
+func TestPrepareRequestKeepsAnthropicVersionForBedrock(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{"model":"opus-5","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`)
+	resolver := resolverStub{"opus-5": {ModelID: "global.anthropic.claude-opus-5", Provider: llm.ProviderBedrock}}
+
+	prepared, err := PrepareRequest(raw, nil, resolver)
+	if err != nil {
+		t.Fatalf("准备请求失败: %v", err)
+	}
+
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(prepared.Body, &body); err != nil {
+		t.Fatalf("解析 body 失败: %v", err)
+	}
+	var version string
+	if err := json.Unmarshal(body["anthropic_version"], &version); err != nil {
+		t.Fatalf("anthropic_version 缺失或非字符串: %v", err)
+	}
+	if version != BedrockAnthropicVersion {
+		t.Fatalf("anthropic_version = %q", version)
 	}
 }
 

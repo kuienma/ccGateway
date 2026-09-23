@@ -6,14 +6,14 @@ import (
 	"time"
 
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/anthropic"
-	"github.com/zhshl/bedrock-anthropic-gateway/internal/bedrock"
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
 )
 
 type Server struct {
 	apiKey                  string
 	maxBodyBytes            int64
 	resolver                anthropic.ModelResolver
-	runtime                 bedrock.Runtime
+	providers               map[string]llm.Provider
 	logger                  *slog.Logger
 	handler                 http.Handler
 	streamHeartbeatInterval time.Duration
@@ -30,12 +30,12 @@ type ServerConfig struct {
 	StreamQueueTimeout      time.Duration
 }
 
-func NewServer(cfg ServerConfig, resolver anthropic.ModelResolver, runtime bedrock.Runtime, logger *slog.Logger) *Server {
+func NewServer(cfg ServerConfig, resolver anthropic.ModelResolver, providers map[string]llm.Provider, logger *slog.Logger) *Server {
 	server := &Server{
 		apiKey:                  cfg.APIKey,
 		maxBodyBytes:            cfg.MaxBodyBytes,
 		resolver:                resolver,
-		runtime:                 runtime,
+		providers:               providers,
 		logger:                  logger,
 		streamHeartbeatInterval: cfg.StreamHeartbeatInterval,
 		streamQueueTimeout:      cfg.StreamQueueTimeout,
@@ -55,4 +55,11 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// providerFor 返回 name 对应的 provider。模型目录已校验过 provider 合法性，
+// 这里取不到说明该 provider 未在启动时注入（例如缺少凭证）。
+func (s *Server) providerFor(name string) (llm.Provider, bool) {
+	provider, ok := s.providers[name]
+	return provider, ok
 }

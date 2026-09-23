@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
 )
 
 func TestMessagesRejectsUnknownModel(t *testing.T) {
@@ -25,7 +27,7 @@ func TestMessagesEnforcesBodyLimit(t *testing.T) {
 	t.Parallel()
 
 	server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 8, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 4, StreamQueueTimeout: time.Second},
-		resolverStub{}, &runtimeStub{}, discardLogger())
+		resolverStub{}, map[string]llm.Provider{llm.ProviderBedrock: &runtimeStub{}}, discardLogger())
 	headers := map[string]string{"x-api-key": testGatewayKey}
 	response := performRequest(server, http.MethodPost, "/v1/messages", bytes.Repeat([]byte("x"), 9), headers)
 
@@ -51,7 +53,7 @@ func TestRejectedRequestsNeverCallUpstream(t *testing.T) {
 			t.Run(path+"/"+tc.name, func(t *testing.T) {
 				runtime := &runtimeStub{}
 				cfg := ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 64, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 1, StreamQueueTimeout: time.Second}
-				response := performRequest(NewServer(cfg, resolverStub{"": "id"}, runtime, discardLogger()), http.MethodPost, path, []byte(tc.body), map[string]string{"x-api-key": testGatewayKey})
+				response := performRequest(NewServer(cfg, resolverStub{"": "id"}, map[string]llm.Provider{llm.ProviderBedrock: runtime}, discardLogger()), http.MethodPost, path, []byte(tc.body), map[string]string{"x-api-key": testGatewayKey})
 				if response.Code != tc.status {
 					t.Fatalf("status=%d, want %d", response.Code, tc.status)
 				}

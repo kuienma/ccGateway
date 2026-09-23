@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
 )
 
 func TestCountTokensClientCancellationDoesNotWriteGatewayError(t *testing.T) {
@@ -15,7 +17,7 @@ func TestCountTokensClientCancellationDoesNotWriteGatewayError(t *testing.T) {
 
 	var logs bytes.Buffer
 	server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1 << 20, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 1, StreamQueueTimeout: time.Second},
-		resolverStub{"opus-5": "model-id"}, &runtimeStub{err: context.Canceled}, slog.New(slog.NewJSONHandler(&logs, nil)))
+		resolverStub{"opus-5": "model-id"}, map[string]llm.Provider{llm.ProviderBedrock: &runtimeStub{err: context.Canceled}}, slog.New(slog.NewJSONHandler(&logs, nil)))
 	response := performRequest(
 		server, http.MethodPost, "/v1/messages/count_tokens",
 		[]byte(`{"model":"opus-5","messages":[]}`),
@@ -51,7 +53,7 @@ func TestCountTokensLogsCompletionFields(t *testing.T) {
 
 	var logs bytes.Buffer
 	server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1 << 20, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 4, StreamQueueTimeout: time.Second},
-		resolverStub{"opus-5": "model-id"}, &runtimeStub{tokenCount: 12}, slog.New(slog.NewJSONHandler(&logs, nil)))
+		resolverStub{"opus-5": "model-id"}, map[string]llm.Provider{llm.ProviderBedrock: &runtimeStub{tokenCount: 12}}, slog.New(slog.NewJSONHandler(&logs, nil)))
 	response := performRequest(
 		server,
 		http.MethodPost,

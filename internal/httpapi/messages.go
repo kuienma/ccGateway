@@ -19,6 +19,12 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	completion.modelID = prepared.ModelID
 	completion.stream = prepared.Stream
+	provider, ok := s.providerFor(prepared.Provider)
+	if !ok {
+		s.writeError(w, r, http.StatusServiceUnavailable, anthropic.ErrorTypeAPI,
+			"模型所属 provider 未启用: "+prepared.Provider)
+		return
+	}
 	if prepared.Stream {
 		if err := s.acquireStream(r.Context()); err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -30,11 +36,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer s.releaseStream()
-		completion.result = completionResult(s.handleStream(w, r, prepared))
+		completion.result = completionResult(s.handleStream(w, r, provider, prepared))
 		return
 	}
 
-	response, err := s.runtime.Invoke(r.Context(), prepared.ModelID, prepared.Body)
+	response, err := provider.Invoke(r.Context(), prepared.ModelID, prepared.Body)
 	if err != nil {
 		completion.result = completionResult(err)
 		if completion.result == "client_canceled" {

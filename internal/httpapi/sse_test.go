@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/anthropic"
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
 )
 
 type blockingRuntime struct {
@@ -129,7 +130,7 @@ func TestStreamSendsHeartbeatWhileWaitingForBedrock(t *testing.T) {
 
 	runtime := &blockingRuntime{started: make(chan struct{}), release: make(chan struct{})}
 	server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1 << 20, StreamHeartbeatInterval: 5 * time.Millisecond, MaxConcurrentStreams: 1, StreamQueueTimeout: 20 * time.Millisecond},
-		resolverStub{"opus-5": "model-id"}, runtime, discardLogger())
+		resolverStub{"opus-5": "model-id"}, map[string]llm.Provider{llm.ProviderBedrock: runtime}, discardLogger())
 	go func() {
 		<-runtime.started
 		time.Sleep(20 * time.Millisecond)
@@ -153,7 +154,7 @@ func TestStreamHeartbeatOnlyFiresWhileIdle(t *testing.T) {
 
 	runtime := &pacedStreamRuntime{interval: 50 * time.Millisecond, chunks: 5}
 	server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1 << 20, StreamHeartbeatInterval: 200 * time.Millisecond, MaxConcurrentStreams: 1, StreamQueueTimeout: 20 * time.Millisecond},
-		resolverStub{"opus-5": "model-id"}, runtime, discardLogger())
+		resolverStub{"opus-5": "model-id"}, map[string]llm.Provider{llm.ProviderBedrock: runtime}, discardLogger())
 	response := performRequest(
 		server, http.MethodPost, "/v1/messages",
 		[]byte(`{"model":"opus-5","max_tokens":1,"messages":[],"stream":true}`),
@@ -169,7 +170,7 @@ func TestStreamReturnsOverloadedWhenConcurrencySlotIsBusy(t *testing.T) {
 
 	runtime := &blockingRuntime{started: make(chan struct{}), release: make(chan struct{})}
 	server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1 << 20, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 1, StreamQueueTimeout: 5 * time.Millisecond},
-		resolverStub{"opus-5": "model-id"}, runtime, discardLogger())
+		resolverStub{"opus-5": "model-id"}, map[string]llm.Provider{llm.ProviderBedrock: runtime}, discardLogger())
 	body := []byte(`{"model":"opus-5","max_tokens":1,"messages":[],"stream":true}`)
 	firstDone := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
@@ -192,7 +193,7 @@ func TestStreamLogsClientCancellation(t *testing.T) {
 	var logs bytes.Buffer
 	runtime := &blockingRuntime{started: make(chan struct{}), release: make(chan struct{})}
 	server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1 << 20, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 1, StreamQueueTimeout: time.Second},
-		resolverStub{"opus-5": "model-id"}, runtime, slog.New(slog.NewJSONHandler(&logs, nil)))
+		resolverStub{"opus-5": "model-id"}, map[string]llm.Provider{llm.ProviderBedrock: runtime}, slog.New(slog.NewJSONHandler(&logs, nil)))
 	ctx, cancel := context.WithCancel(context.Background())
 	request := httptest.NewRequest(
 		http.MethodPost,
@@ -221,7 +222,7 @@ func TestStreamSlotRemainsOccupiedUntilRuntimeExits(t *testing.T) {
 		started: make(chan struct{}), cancelObserved: make(chan struct{}), allowExit: make(chan struct{}),
 	}
 	server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1 << 20, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 1, StreamQueueTimeout: 5 * time.Millisecond},
-		resolverStub{"opus-5": "model-id"}, runtime, discardLogger())
+		resolverStub{"opus-5": "model-id"}, map[string]llm.Provider{llm.ProviderBedrock: runtime}, discardLogger())
 	body := []byte(`{"model":"opus-5","max_tokens":1,"messages":[],"stream":true}`)
 	ctx, cancel := context.WithCancel(context.Background())
 	request := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body)).WithContext(ctx)
@@ -252,7 +253,7 @@ func TestCanceledWhileWaitingForStreamSlotIsNotOverloaded(t *testing.T) {
 	var logs bytes.Buffer
 	runtime := &blockingRuntime{started: make(chan struct{}), release: make(chan struct{})}
 	server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1 << 20, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 1, StreamQueueTimeout: time.Second},
-		resolverStub{"opus-5": "model-id"}, runtime, slog.New(slog.NewJSONHandler(&logs, nil)))
+		resolverStub{"opus-5": "model-id"}, map[string]llm.Provider{llm.ProviderBedrock: runtime}, slog.New(slog.NewJSONHandler(&logs, nil)))
 	body := []byte(`{"model":"opus-5","max_tokens":1,"messages":[],"stream":true}`)
 	firstDone := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
@@ -310,7 +311,7 @@ func TestStreamWriteFailureWaitsForRuntimeBeforeReleasingSlot(t *testing.T) {
 				<-allowExit
 				return ctx.Err()
 			}}
-			server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1024, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 1, StreamQueueTimeout: time.Millisecond}, resolverStub{"": "id"}, runtime, discardLogger())
+			server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1024, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 1, StreamQueueTimeout: time.Millisecond}, resolverStub{"": "id"}, map[string]llm.Provider{llm.ProviderBedrock: runtime}, discardLogger())
 			request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"stream":true}`))
 			request.Header.Set("x-api-key", testGatewayKey)
 			var writer http.ResponseWriter = httptest.NewRecorder()
@@ -344,7 +345,7 @@ func TestStreamUpstreamErrorKeepsRequestIDAndDoesNotReplay(t *testing.T) {
 	t.Parallel()
 	var logs bytes.Buffer
 	runtime := &runtimeStub{streamChunks: [][]byte{[]byte(`{"type":"message_start"}`)}, err: errors.New("upstream reset")}
-	server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1024, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 1, StreamQueueTimeout: time.Second}, resolverStub{"": "id"}, runtime, slog.New(slog.NewJSONHandler(&logs, nil)))
+	server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1024, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 1, StreamQueueTimeout: time.Second}, resolverStub{"": "id"}, map[string]llm.Provider{llm.ProviderBedrock: runtime}, slog.New(slog.NewJSONHandler(&logs, nil)))
 	response := performRequest(server, http.MethodPost, "/v1/messages", []byte(`{"stream":true}`), map[string]string{"x-api-key": testGatewayKey})
 	if response.Code != 200 || !response.Flushed {
 		t.Fatalf("response=%+v", response)

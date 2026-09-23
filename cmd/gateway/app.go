@@ -12,6 +12,7 @@ import (
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/bedrock"
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/config"
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/httpapi"
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/modelcatalog"
 )
 
@@ -34,7 +35,8 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	server := newHTTPServer(cfg, models, runtime, logger)
+	providers := map[string]llm.Provider{llm.ProviderBedrock: runtime}
+	server := newHTTPServer(cfg, models, providers, logger)
 	logger.Info("Bedrock Anthropic 网关已启动", "address", cfg.ListenAddr, "region", cfg.AWSRegion)
 	return runServer(ctx, server, models.Reload, cfg.ShutdownTimeout, logger)
 }
@@ -52,7 +54,7 @@ func newRuntime(ctx context.Context, region string) (bedrock.Runtime, error) {
 	return bedrock.NewClient(bedrockruntime.NewFromConfig(awsCfg)), nil
 }
 
-func newHTTPServer(cfg config.Config, models anthropic.ModelResolver, runtime bedrock.Runtime, logger *slog.Logger) *http.Server {
+func newHTTPServer(cfg config.Config, models anthropic.ModelResolver, providers map[string]llm.Provider, logger *slog.Logger) *http.Server {
 	api := httpapi.NewServer(httpapi.ServerConfig{
 		APIKey:                  cfg.GatewayAPIKey,
 		MaxBodyBytes:            cfg.MaxBodyBytes,
@@ -60,7 +62,7 @@ func newHTTPServer(cfg config.Config, models anthropic.ModelResolver, runtime be
 		MaxConcurrentStreams:    cfg.MaxConcurrentStreams,
 		StreamQueueTimeout:      cfg.StreamQueueTimeout,
 	},
-		models, runtime, logger)
+		models, providers, logger)
 	return &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           api.Handler(),
