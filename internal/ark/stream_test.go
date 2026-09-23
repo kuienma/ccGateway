@@ -139,6 +139,62 @@ func TestStreamDoesNotEmitThinkingByDefault(t *testing.T) {
 	}
 }
 
+// TestStreamEmitsThinkingWhenRequested 钉住 Stream 与 EventEmitter 之间的**接线**：
+// includeThinking 实参必须来自客户端意图，不能是写死的 false。
+//
+// 这是接线而非函数的护栏。translate 包里已有用例覆盖 EventEmitter 在
+// includeThinking=true 时产出 thinking 块的行为，但那条用例直接构造 emitter、
+// 完全绕过 client.go 那一行实参；把实参改回 false 时 translate 包仍然全绿。
+// 只有在这里从客户端请求体出发走完整条 Stream，才能抓住「函数对了、接线没接」。
+func TestStreamEmitsThinkingWhenRequested(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t, streamingHandler(arkToolStream))
+	events := collectStream(t, client,
+		`{"max_tokens":64,"thinking":{"type":"enabled","budget_tokens":1024},
+		  "messages":[{"role":"user","content":"hi"}]}`)
+
+	var sawThinking bool
+	for _, event := range events {
+		if event["type"] != "content_block_start" {
+			continue
+		}
+		if event["content_block"].(map[string]any)["type"] == "thinking" {
+			sawThinking = true
+		}
+	}
+	if !sawThinking {
+		t.Fatal("客户端请求 thinking 时应透出 thinking 块")
+	}
+
+	// thinking 块必须是第一个内容块（Anthropic 协议要求）。
+	for _, event := range events {
+		if event["type"] != "content_block_start" {
+			continue
+		}
+		if event["content_block"].(map[string]any)["type"] != "thinking" {
+			t.Fatal("thinking 块必须排在其他内容块之前")
+		}
+		break
+	}
+
+	// 内容也要对：arkToolStream 的 reasoning_content 是 "The"，光有空壳块说明
+	// delta 没跟着透出。
+	var thinking string
+	for _, event := range events {
+		if event["type"] != "content_block_delta" {
+			continue
+		}
+		delta := event["delta"].(map[string]any)
+		if delta["type"] == "thinking_delta" {
+			thinking += delta["thinking"].(string)
+		}
+	}
+	if thinking != "The" {
+		t.Fatalf("thinking 正文 = %q，期望上游 reasoning_content 原样透出 %q", thinking, "The")
+	}
+}
+
 func TestStreamReportsTruncatedStream(t *testing.T) {
 	t.Parallel()
 

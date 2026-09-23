@@ -81,6 +81,11 @@ func BuildRequest(modelID string, anthropicBody []byte, stream bool) (*ChatReque
 		Stop:        source.StopSequences,
 		Stream:      stream,
 	}
+	// 超过模型上限的 max_tokens 直接钳制，不报错 —— Claude Code 常按
+	// Anthropic 模型的上限填值，拒绝会让请求白失败。
+	if request.MaxTokens > MaxOutputTokens {
+		request.MaxTokens = MaxOutputTokens
+	}
 	if stream {
 		// 末尾额外一个 choices 为空的 usage chunk，用于拿到真实 token 数。
 		request.StreamOptions = &StreamOptions{IncludeUsage: true}

@@ -295,6 +295,145 @@ func TestInvokeAttributesBadUpstreamBodyToServer(t *testing.T) {
 	}
 }
 
+// reasoningResponse 是一条带 reasoning_content 的非流式响应，形态取自真机。
+const reasoningResponse = `{"id":"r1","model":"m","choices":[{"finish_reason":"stop",
+	"message":{"role":"assistant","content":"晴","reasoning_content":"先查天气"}}],
+	"usage":{"prompt_tokens":89,"completion_tokens":11}}`
+
+// TestInvokeEmitsThinkingWhenRequested 钉住 Invoke 与 BuildResponse 之间的**接线**。
+//
+// 与流式那条同一条教训：translate 包里已有用例覆盖 BuildResponse 在
+// includeThinking=true 时产出 thinking 块，但它直接调函数，绕开了 client.go 里那个
+// 实参。把实参写回固定 false（或重构漏传）时 translate 包全绿，只有从客户端请求体
+// 出发走完整条 Invoke 才能抓住。两条路径各要一条，缺一条就有半边没护栏。
+func TestInvokeEmitsThinkingWhenRequested(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(reasoningResponse))
+	})
+
+	out, err := client.Invoke(context.Background(), "m",
+		[]byte(`{"max_tokens":64,"thinking":{"type":"enabled","budget_tokens":1024},
+			"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("Invoke 失败: %v", err)
+	}
+
+	var decoded struct {
+		Content []struct {
+			Type     string `json:"type"`
+			Text     string `json:"text"`
+			Thinking string `json:"thinking"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("返回值不是合法 JSON: %v", err)
+	}
+	if len(decoded.Content) == 0 {
+		t.Fatal("响应不含任何内容块")
+	}
+	// 断言首块就是 thinking，同时锁住「thinking 排最前」这条协议要求。
+	if decoded.Content[0].Type != "thinking" {
+		t.Fatalf("首个内容块 = %q，客户端请求 thinking 时应是 thinking 块: %#v",
+			decoded.Content[0].Type, decoded.Content)
+	}
+	// 正文也要对，空壳块说明 reasoning_content 没搬过来。
+	if decoded.Content[0].Thinking != "先查天气" {
+		t.Fatalf("thinking 正文 = %q，期望上游 reasoning_content 原样透出",
+			decoded.Content[0].Thinking)
+	}
+	// text 块不能因为多了 thinking 而丢。
+	if len(decoded.Content) < 2 || decoded.Content[1].Type != "text" {
+		t.Fatalf("thinking 块之后应仍有 text 块: %#v", decoded.Content)
+	}
+}
+
+// TestInvokeDoesNotEmitThinkingByDefault 是上面那条的反向配对：客户端没请求 thinking
+// 时一个 thinking 块都不能有。缺了它，把接线改成恒 true 的变异不会被任何用例抓到。
+func TestInvokeDoesNotEmitThinkingByDefault(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(reasoningResponse))
+	})
+
+	out, err := client.Invoke(context.Background(), "m",
+		[]byte(`{"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("Invoke 失败: %v", err)
+	}
+
+	var decoded struct {
+		Content []struct {
+			Type string `json:"type"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("返回值不是合法 JSON: %v", err)
+	}
+	for _, block := range decoded.Content {
+		if block.Type == "thinking" {
+			t.Fatal("客户端未请求 thinking 时不应透出 thinking 块")
+		}
+	}
+}
+
+// TestCountTokensEstimatesLocally 钉住 CountTokens 纯本地估算：Ark 没有 count_tokens
+// 端点，任何上游调用都会 404。
+func TestCountTokensEstimatesLocally(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("CountTokens 不应发起上游请求：Ark 没有 count_tokens 端点")
+	})
+
+	body := []byte(`{"max_tokens":64,"messages":[{"role":"user","content":"北京今天天气怎么样"}]}`)
+	count, err := client.CountTokens(context.Background(), "m", body)
+	if err != nil {
+		t.Fatalf("CountTokens 失败: %v", err)
+	}
+	if count <= 0 {
+		t.Fatalf("估算值 = %d", count)
+	}
+	// 与 translate.EstimateTokens 的结果必须一致：中间做任何缩放/截断都会让
+	// 上下文预算与真实估算脱钩。
+	want, err := translate.EstimateTokens(body)
+	if err != nil {
+		t.Fatalf("EstimateTokens 失败: %v", err)
+	}
+	if count != want {
+		t.Fatalf("CountTokens = %d，应与 translate.EstimateTokens 的 %d 一致", count, want)
+	}
+}
+
+// TestCountTokensAttributesMalformedBodyToClient 钉住错误归因：请求体是客户端给的，
+// 必须映射成 400 / invalid_request_error，而不是 5xx。
+func TestCountTokensAttributesMalformedBodyToClient(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("CountTokens 不应发起上游请求")
+	})
+
+	_, err := client.CountTokens(context.Background(), "m", []byte(`[]`))
+	if err == nil {
+		t.Fatal("畸形请求体必须报错")
+	}
+	var statusErr llm.StatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("错误应实现 llm.StatusError，实际 %T", err)
+	}
+	if statusErr.Status() != http.StatusBadRequest {
+		t.Fatalf("Status = %d，期望 400", statusErr.Status())
+	}
+	if statusErr.Kind() != anthropic.ErrorTypeInvalidRequest {
+		t.Fatalf("Kind = %q，期望 %q", statusErr.Kind(), anthropic.ErrorTypeInvalidRequest)
+	}
+}
+
 // TestRejectionKindMatchesAnthropicErrorType 把 translate 包内的 invalid_request_error
 // 字面量与 anthropic.ErrorTypeInvalidRequest 钉在一起。translate 刻意零 import
 // internal/anthropic 以保持纯函数独立，代价是两处常量没有编译期耦合；ark 是第一个

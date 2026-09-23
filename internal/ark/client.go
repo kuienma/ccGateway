@@ -119,9 +119,11 @@ func (c *Client) Invoke(ctx context.Context, modelID string, body []byte) ([]byt
 	}
 	// BuildResponse 的输入是上游响应体，出错不是客户端的责任：这里刻意返回普通
 	// error 而不是 rejectionError，让 httpapi 兜底成 5xx / api_error。
-	// includeThinking 由请求是否显式开启 thinking 决定，见 Task 11；
-	// 当前阶段固定不透出 thinking 块。
-	return translate.BuildResponse(payload, modelID, false)
+	//
+	// includeThinking 只看客户端是否显式请求：Ark 不传 thinking 时默认开启思考，
+	// 上游几乎总会回 reasoning_content，而 Anthropic 协议在客户端未请求时不应返回
+	// thinking 块。请求侧的开关在 BuildRequest 里，两侧必须读同一份客户端意图。
+	return translate.BuildResponse(payload, modelID, translate.WantsThinking(body))
 }
 
 // post 完成请求转换并发起 HTTP 调用，调用方负责关闭 Body。
@@ -216,8 +218,8 @@ func (c *Client) Stream(ctx context.Context, modelID string, body []byte, emit f
 		return c.errorFromResponse(response)
 	}
 
-	// includeThinking 在 Task 11 接上客户端的 thinking 开关，当前一律不透出。
-	emitter := translate.NewEventEmitter(modelID, false, emit)
+	// includeThinking 与非流式 Invoke 读同一份客户端意图，两条路径不能分叉。
+	emitter := translate.NewEventEmitter(modelID, translate.WantsThinking(body), emit)
 	sawDone, err := scanSSE(response.Body, emitter.Consume)
 	// scanSSE 的错误绝不能吞掉：状态机在写 message_stop **之前**就把 finished 置真了，
 	// 那次 write 失败时 emitter 已进吸收态、Finish 只会返回 nil，此时唯一还能反映失败的
@@ -228,7 +230,20 @@ func (c *Client) Stream(ctx context.Context, modelID string, body []byte, emit f
 	return emitter.Finish(sawDone)
 }
 
-// CountTokens 在 Task 11 实现。
-func (c *Client) CountTokens(ctx context.Context, modelID string, body []byte) (int32, error) {
-	return 0, fmt.Errorf("ark token 计数尚未实现")
+// CountTokens 本地估算输入 token 数。
+//
+// Ark 没有 count_tokens 端点，所以这里不发起任何上游请求。估算刻意偏向高估：
+// Claude Code 用这个值做上下文预算，低估会让它以为还有余量、真实请求被上游拒绝。
+//
+// 请求体是客户端给的，解析失败要归因客户端（400 / invalid_request_error），
+// 不能兜成 5xx。
+func (c *Client) CountTokens(_ context.Context, _ string, body []byte) (int32, error) {
+	count, err := translate.EstimateTokens(body)
+	if err != nil {
+		return 0, &rejectionError{rejection: &translate.Rejection{
+			Kind:    anthropic.ErrorTypeInvalidRequest,
+			Message: "请求体无法解析，无法估算 token 数",
+		}}
+	}
+	return count, nil
 }
