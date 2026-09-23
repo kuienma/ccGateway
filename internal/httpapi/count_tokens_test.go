@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/anthropic"
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
 )
 
@@ -74,4 +75,23 @@ func TestCountTokensLogsCompletionFields(t *testing.T) {
 			t.Fatalf("日志缺少 %s: %s", expected, logs.String())
 		}
 	}
+}
+
+// TestCountTokensRejectsUnwiredProviderWithServerError 与 messages 的同一分支：
+// provider 未注入属于服务端装配错误，必须是 500 + api_error。
+func TestCountTokensRejectsUnwiredProviderWithServerError(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1 << 20, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 1, StreamQueueTimeout: time.Second},
+		providerResolverStub{"ds-flash": {ModelID: "deepseek-v4-flash-ga-260731", Provider: llm.ProviderArk}},
+		map[string]llm.Provider{llm.ProviderBedrock: &runtimeStub{}}, discardLogger())
+	response := performRequest(
+		server, http.MethodPost, "/v1/messages/count_tokens",
+		[]byte(`{"model":"ds-flash","messages":[]}`),
+		map[string]string{"x-api-key": testGatewayKey},
+	)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	assertErrorType(t, response.Body.Bytes(), anthropic.ErrorTypeAPI)
 }

@@ -25,6 +25,15 @@ func (r resolverStub) Resolve(name string) (llm.Resolution, bool) {
 	return llm.Resolution{ModelID: modelID, Provider: llm.ProviderBedrock}, true
 }
 
+// providerResolverStub 返回完整的解析结果，用于构造「模型登记为某 provider，
+// 但该 provider 未注入 providers 表」的装配错误场景。
+type providerResolverStub map[string]llm.Resolution
+
+func (r providerResolverStub) Resolve(name string) (llm.Resolution, bool) {
+	resolution, ok := r[name]
+	return resolution, ok
+}
+
 type runtimeStub struct {
 	modelID      string
 	body         []byte

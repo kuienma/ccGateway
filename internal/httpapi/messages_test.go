@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/anthropic"
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
 )
 
@@ -113,5 +114,29 @@ func TestNonStreamingUpstreamFailureWritesAndLogsGatewayError(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), `"level":"ERROR"`) || !strings.Contains(logs.String(), `"result":"upstream_error"`) {
 		t.Fatalf("上游失败日志级别或结果错误: %s", logs.String())
+	}
+}
+
+// TestMessagesRejectsUnwiredProviderWithServerError 覆盖服务端装配错误分支：
+// 模型在目录里登记为 ark，但 providers 表里没有 ark（例如漏注入）。
+// 这是配置问题而非过载，重试永远不会变好，所以必须是 500 + api_error；
+// 503 在本仓库已被上游过载语义占用，用它会诱导客户端做无效重试。
+func TestMessagesRejectsUnwiredProviderWithServerError(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(ServerConfig{APIKey: testGatewayKey, MaxBodyBytes: 1 << 20, StreamHeartbeatInterval: time.Hour, MaxConcurrentStreams: 1, StreamQueueTimeout: time.Second},
+		providerResolverStub{"ds-flash": {ModelID: "deepseek-v4-flash-ga-260731", Provider: llm.ProviderArk}},
+		map[string]llm.Provider{llm.ProviderBedrock: &runtimeStub{}}, discardLogger())
+	response := performRequest(
+		server, http.MethodPost, "/v1/messages",
+		[]byte(`{"model":"ds-flash","max_tokens":1,"messages":[]}`),
+		map[string]string{"x-api-key": testGatewayKey},
+	)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	assertErrorType(t, response.Body.Bytes(), anthropic.ErrorTypeAPI)
+	if !strings.Contains(response.Body.String(), "ark") {
+		t.Fatalf("错误描述应指出未启用的 provider: %s", response.Body.String())
 	}
 }

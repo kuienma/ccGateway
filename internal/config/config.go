@@ -16,6 +16,8 @@ const (
 	DefaultStreamHeartbeatInterval = 15 * time.Second
 	DefaultMaxConcurrentStreams    = 4
 	DefaultStreamQueueTimeout      = 30 * time.Second
+	DefaultArkBaseURL              = "https://ark.cn-beijing.volces.com/api/v3"
+	DefaultArkTimeout              = 120 * time.Second
 )
 
 type Config struct {
@@ -28,6 +30,9 @@ type Config struct {
 	StreamHeartbeatInterval time.Duration
 	MaxConcurrentStreams    int
 	StreamQueueTimeout      time.Duration
+	ArkAPIKey               string
+	ArkBaseURL              string
+	ArkTimeout              time.Duration
 }
 
 type LookupFunc func(string) (string, bool)
@@ -47,6 +52,11 @@ func LoadFromLookup(lookup LookupFunc) (Config, error) {
 		StreamHeartbeatInterval: DefaultStreamHeartbeatInterval,
 		MaxConcurrentStreams:    DefaultMaxConcurrentStreams,
 		StreamQueueTimeout:      DefaultStreamQueueTimeout,
+		// ARK_API_KEY 允许为空：只有 models.json 登记了 ark 模型时才必填，
+		// 该校验放在启动装配处，纯 Bedrock 部署无需提供 Ark 凭证。
+		ArkAPIKey:  strings.TrimSpace(value(lookup, "ARK_API_KEY")),
+		ArkBaseURL: valueOrDefault(lookup, "ARK_BASE_URL", DefaultArkBaseURL),
+		ArkTimeout: DefaultArkTimeout,
 	}
 
 	if cfg.AWSRegion == "" {
@@ -71,6 +81,9 @@ func LoadFromLookup(lookup LookupFunc) (Config, error) {
 	}
 	cfg.MaxConcurrentStreams = int(streams)
 	if cfg.StreamQueueTimeout, err = positiveDuration(lookup, "STREAM_QUEUE_TIMEOUT", cfg.StreamQueueTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.ArkTimeout, err = positiveDuration(lookup, "ARK_TIMEOUT", cfg.ArkTimeout); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil

@@ -21,7 +21,9 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	completion.stream = prepared.Stream
 	provider, ok := s.providerFor(prepared.Provider)
 	if !ok {
-		s.writeError(w, r, http.StatusServiceUnavailable, anthropic.ErrorTypeAPI,
+		// 服务端装配错误：模型在目录里登记了该 provider，但它没被注入。
+		// 重试不会改变结果，所以用 500 而不是 503（503 表示上游过载，可重试）。
+		s.writeError(w, r, http.StatusInternalServerError, anthropic.ErrorTypeAPI,
 			"模型所属 provider 未启用: "+prepared.Provider)
 		return
 	}

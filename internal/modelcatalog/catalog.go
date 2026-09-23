@@ -23,3 +23,16 @@ func (c *Catalog) Resolve(name string) (llm.Resolution, bool) {
 	resolution, ok := c.resolutions[name]
 	return resolution, ok
 }
+
+// UsesProvider 报告目录中是否存在归属该 provider 的模型。
+func (c *Catalog) UsesProvider(provider string) bool {
+	if c == nil {
+		return false
+	}
+	for _, resolution := range c.resolutions {
+		if resolution.Provider == provider {
+			return true
+		}
+	}
+	return false
+}

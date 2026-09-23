@@ -1,6 +1,8 @@
 package modelcatalog
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
@@ -105,6 +107,72 @@ func TestParseAssignsProviderWithBedrockDefault(t *testing.T) {
 	}
 	if deepseek.ModelID != "deepseek-v4-flash-ga-260731" {
 		t.Fatalf("ModelID = %q", deepseek.ModelID)
+	}
+}
+
+func TestUsesProviderReportsCatalogMembership(t *testing.T) {
+	t.Parallel()
+
+	bedrockOnly, err := Parse([]byte(`{"default":"a","models":[{"id":"a"}]}`))
+	if err != nil {
+		t.Fatalf("解析配置失败: %v", err)
+	}
+	if !bedrockOnly.UsesProvider(llm.ProviderBedrock) {
+		t.Fatal("纯 bedrock 目录应报告使用 bedrock")
+	}
+	if bedrockOnly.UsesProvider(llm.ProviderArk) {
+		t.Fatal("未登记 ark 模型时不应报告使用 ark")
+	}
+
+	mixed, err := Parse([]byte(`{"default":"a","models":[{"id":"a"},{"id":"b","provider":"ark"}]}`))
+	if err != nil {
+		t.Fatalf("解析配置失败: %v", err)
+	}
+	if !mixed.UsesProvider(llm.ProviderArk) || !mixed.UsesProvider(llm.ProviderBedrock) {
+		t.Fatal("混合目录应同时报告两个 provider")
+	}
+
+	var absent *Catalog
+	if absent.UsesProvider(llm.ProviderArk) {
+		t.Fatal("nil 目录不应报告使用任何 provider")
+	}
+}
+
+// TestRepositoryModelsConfigIsValid 直接读仓库里真实的 configs/models.json，
+// 守住「Bedrock 路径零变化」这条全局约束：真实配置必须能解析，
+// 且原有的 Anthropic 模型在未显式声明 provider 时仍缺省落到 bedrock。
+func TestRepositoryModelsConfigIsValid(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(filepath.Join("..", "..", "configs", "models.json"))
+	if err != nil {
+		t.Fatalf("读取真实模型配置失败: %v", err)
+	}
+	catalog, err := Parse(data)
+	if err != nil {
+		t.Fatalf("真实模型配置无法解析: %v", err)
+	}
+
+	for _, name := range []string{
+		"global.anthropic.claude-opus-5", "claude-opus-5", "opus-5",
+		"global.anthropic.claude-opus-4-8", "claude-opus-4-8", "opus-4-8",
+	} {
+		resolved, ok := catalog.Resolve(name)
+		if !ok {
+			t.Fatalf("真实配置中 %q 应可解析", name)
+		}
+		if resolved.Provider != llm.ProviderBedrock {
+			t.Fatalf("%q 的 provider = %q，Anthropic 模型必须缺省落到 bedrock", name, resolved.Provider)
+		}
+	}
+
+	// 缺省模型（空模型名）也必须仍然是 bedrock 上的模型。
+	defaultResolution, ok := catalog.Resolve("")
+	if !ok {
+		t.Fatal("真实配置应有可解析的缺省模型")
+	}
+	if defaultResolution.Provider != llm.ProviderBedrock {
+		t.Fatalf("缺省模型 provider = %q，期望 bedrock", defaultResolution.Provider)
 	}
 }
 

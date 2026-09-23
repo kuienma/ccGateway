@@ -7,6 +7,7 @@ import (
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/anthropic"
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
 )
 
 const errorType = "error"
@@ -24,14 +25,20 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, status int, 
 
 func (s *Server) handleUpstreamError(w http.ResponseWriter, r *http.Request, err error) {
 	status, kind, message := classifyUpstreamError(err)
-	s.logger.Error("Bedrock 请求失败", "request_id", requestID(r.Context()), "status", status, "error", err)
+	s.logger.Error("上游请求失败", "request_id", requestID(r.Context()), "status", status, "error", err)
 	s.writeError(w, r, status, kind, message)
 }
 
 func classifyUpstreamError(err error) (int, string, string) {
+	// provider 自带分类时优先采用，避免 HTTP 层耦合具体厂商 SDK。
+	var statusErr llm.StatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.Status(), statusErr.Kind(), statusErr.ClientMessage()
+	}
+
 	status := http.StatusBadGateway
 	kind := anthropic.ErrorTypeAPI
-	message := "Bedrock 请求失败"
+	message := "上游请求失败"
 
 	var responseError *smithyhttp.ResponseError
 	if errors.As(err, &responseError) {

@@ -37,7 +37,29 @@ func TestClassifyUpstreamErrorFallsBackToBadGatewayForMissingStatus(t *testing.T
 	if status != http.StatusBadGateway || kind != anthropic.ErrorTypeAPI {
 		t.Fatalf("映射结果 = %d, %s", status, kind)
 	}
-	if message != "Bedrock 请求失败" {
+	if message != "上游请求失败" {
+		t.Fatalf("message = %q", message)
+	}
+}
+
+type stubStatusError struct{}
+
+func (stubStatusError) Error() string         { return "stub" }
+func (stubStatusError) Status() int           { return http.StatusTooManyRequests }
+func (stubStatusError) Kind() string          { return anthropic.ErrorTypeRateLimit }
+func (stubStatusError) ClientMessage() string { return "配额已用尽" }
+
+func TestClassifyUpstreamErrorPrefersStatusError(t *testing.T) {
+	t.Parallel()
+
+	status, kind, message := classifyUpstreamError(stubStatusError{})
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("status = %d", status)
+	}
+	if kind != anthropic.ErrorTypeRateLimit {
+		t.Fatalf("kind = %q", kind)
+	}
+	if message != "配额已用尽" {
 		t.Fatalf("message = %q", message)
 	}
 }

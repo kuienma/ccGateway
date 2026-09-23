@@ -18,7 +18,8 @@ func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	completion.modelID = prepared.ModelID
 	provider, ok := s.providerFor(prepared.Provider)
 	if !ok {
-		s.writeError(w, r, http.StatusServiceUnavailable, anthropic.ErrorTypeAPI,
+		// 同 handleMessages：provider 未注入是服务端装配错误，用 500 而不是 503。
+		s.writeError(w, r, http.StatusInternalServerError, anthropic.ErrorTypeAPI,
 			"模型所属 provider 未启用: "+prepared.Provider)
 		return
 	}

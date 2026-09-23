@@ -36,3 +36,15 @@ type Provider interface {
 	Stream(ctx context.Context, modelID string, body []byte, emit func([]byte) error) error
 	CountTokens(ctx context.Context, modelID string, body []byte) (int32, error)
 }
+
+// StatusError 由 provider 的错误实现，向 HTTP 层给出应回给客户端的状态码与错误类型。
+// httpapi 优先按此接口分类，避免 HTTP 层耦合具体厂商的 SDK 错误类型。
+type StatusError interface {
+	error
+	// Status 返回应回给客户端的 HTTP 状态码。
+	Status() int
+	// Kind 返回 Anthropic 错误类型（anthropic.ErrorType* 的值）。
+	Kind() string
+	// ClientMessage 返回可安全暴露给客户端的错误描述。
+	ClientMessage() string
+}

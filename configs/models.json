@@ -16,6 +16,14 @@
         "opus-4-8",
         "Qwen3.8-Flash"
       ]
+    },
+    {
+      "id": "deepseek-v4-flash-ga-260731",
+      "provider": "ark",
+      "aliases": [
+        "deepseek-v4-flash",
+        "ds-flash"
+      ]
     }
   ]
 }

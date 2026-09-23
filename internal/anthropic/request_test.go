@@ -156,6 +156,35 @@ func TestPrepareRequestSkipsAnthropicVersionForArk(t *testing.T) {
 	}
 }
 
+// TestPrepareRequestSkipsAnthropicBetaForArk 补齐上一个用例的盲区：
+// 它传的 betaFeatures 是 nil，并未真正验证 ark 路径在客户端带了
+// anthropic-beta 头时也不注入 anthropic_beta。
+func TestPrepareRequestSkipsAnthropicBetaForArk(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{"model":"ds-flash","max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`)
+	resolver := resolverStub{"ds-flash": {ModelID: "deepseek-v4-flash-ga-260731", Provider: llm.ProviderArk}}
+
+	prepared, err := PrepareRequest(raw, []string{"beta-a", "beta-b"}, resolver)
+	if err != nil {
+		t.Fatalf("准备请求失败: %v", err)
+	}
+	if prepared.Provider != llm.ProviderArk {
+		t.Fatalf("Provider = %q，期望 ark", prepared.Provider)
+	}
+
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(prepared.Body, &body); err != nil {
+		t.Fatalf("解析 body 失败: %v", err)
+	}
+	if _, exists := body["anthropic_beta"]; exists {
+		t.Fatalf("ark 路径不应注入 anthropic_beta: %s", prepared.Body)
+	}
+	if _, exists := body["anthropic_version"]; exists {
+		t.Fatalf("ark 路径不应注入 anthropic_version: %s", prepared.Body)
+	}
+}
+
 func TestPrepareRequestKeepsAnthropicVersionForBedrock(t *testing.T) {
 	t.Parallel()
 

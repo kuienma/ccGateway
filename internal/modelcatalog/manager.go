@@ -39,3 +39,7 @@ func (m *Manager) Reload() error {
 func (m *Manager) Resolve(name string) (llm.Resolution, bool) {
 	return m.current.Load().Resolve(name)
 }
+
+func (m *Manager) UsesProvider(provider string) bool {
+	return m.current.Load().UsesProvider(provider)
+}

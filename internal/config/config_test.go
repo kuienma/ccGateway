@@ -248,6 +248,58 @@ func TestLoadFromLookupTrimsAndPrefersAWSRegion(t *testing.T) {
 	}
 }
 
+func TestLoadFromLookupArkDefaults(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := LoadFromLookup(lookupValues(map[string]string{
+		"AWS_REGION":      "us-east-1",
+		"GATEWAY_API_KEY": "k",
+	}))
+	if err != nil {
+		t.Fatalf("加载配置失败: %v", err)
+	}
+	if cfg.ArkBaseURL != DefaultArkBaseURL {
+		t.Fatalf("ArkBaseURL = %q", cfg.ArkBaseURL)
+	}
+	if cfg.ArkAPIKey != "" {
+		t.Fatal("未设置 ARK_API_KEY 时应为空而不是报错")
+	}
+	if cfg.ArkTimeout != DefaultArkTimeout {
+		t.Fatalf("ArkTimeout = %v", cfg.ArkTimeout)
+	}
+}
+
+func TestLoadFromLookupArkOverrides(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := LoadFromLookup(lookupValues(map[string]string{
+		"AWS_REGION":      "us-east-1",
+		"GATEWAY_API_KEY": "k",
+		"ARK_API_KEY":     " ark-secret ",
+		"ARK_BASE_URL":    " https://example.test/api/v3 ",
+		"ARK_TIMEOUT":     "30s",
+	}))
+	if err != nil {
+		t.Fatalf("加载配置失败: %v", err)
+	}
+	if cfg.ArkAPIKey != "ark-secret" {
+		t.Fatalf("ArkAPIKey = %q", cfg.ArkAPIKey)
+	}
+	if cfg.ArkBaseURL != "https://example.test/api/v3" {
+		t.Fatalf("ArkBaseURL = %q", cfg.ArkBaseURL)
+	}
+	if cfg.ArkTimeout != 30*time.Second {
+		t.Fatalf("ArkTimeout = %v", cfg.ArkTimeout)
+	}
+	if _, err := LoadFromLookup(lookupValues(map[string]string{
+		"AWS_REGION":      "us-east-1",
+		"GATEWAY_API_KEY": "k",
+		"ARK_TIMEOUT":     "0s",
+	})); err == nil {
+		t.Fatal("ARK_TIMEOUT=0s 应被拒绝")
+	}
+}
+
 func lookupValues(values map[string]string) LookupFunc {
 	return func(key string) (string, bool) { value, ok := values[key]; return value, ok }
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -9,6 +10,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/anthropic"
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/ark"
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/bedrock"
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/config"
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/httpapi"
@@ -35,10 +37,31 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	providers := map[string]llm.Provider{llm.ProviderBedrock: runtime}
+	providers, err := buildProviders(cfg, models, runtime)
+	if err != nil {
+		return err
+	}
 	server := newHTTPServer(cfg, models, providers, logger)
 	logger.Info("Bedrock Anthropic 网关已启动", "address", cfg.ListenAddr, "region", cfg.AWSRegion)
 	return runServer(ctx, server, models.Reload, cfg.ShutdownTimeout, logger)
+}
+
+// buildProviders 按模型目录实际用到的 provider 装配实现。
+// 目录里登记了 ark 模型却没有凭证时直接启动失败，不留到首个请求才报错。
+func buildProviders(cfg config.Config, models *modelcatalog.Manager, runtime bedrock.Runtime) (map[string]llm.Provider, error) {
+	providers := map[string]llm.Provider{llm.ProviderBedrock: runtime}
+	if !models.UsesProvider(llm.ProviderArk) {
+		return providers, nil
+	}
+	if cfg.ArkAPIKey == "" {
+		return nil, fmt.Errorf("模型配置登记了 ark 模型，必须设置 ARK_API_KEY")
+	}
+	providers[llm.ProviderArk] = ark.NewClient(ark.Config{
+		APIKey:  cfg.ArkAPIKey,
+		BaseURL: cfg.ArkBaseURL,
+		Timeout: cfg.ArkTimeout,
+	})
+	return providers, nil
 }
 
 func newRuntime(ctx context.Context, region string) (bedrock.Runtime, error) {

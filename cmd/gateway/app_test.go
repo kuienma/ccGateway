@@ -4,12 +4,15 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/config"
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/modelcatalog"
 )
 
 func TestRunRejectsConfigurationBeforeStarting(t *testing.T) {
@@ -23,6 +26,54 @@ func TestRunRejectsConfigurationBeforeStarting(t *testing.T) {
 	t.Setenv("MODEL_CONFIG_FILE", filepath.Join(t.TempDir(), "missing.json"))
 	if err := run(context.Background(), testLogger()); err == nil || !strings.Contains(err.Error(), "读取模型配置") {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestBuildProvidersRequiresArkKeyOnlyWhenArkModelRegistered(t *testing.T) {
+	t.Parallel()
+
+	newManager := func(t *testing.T, body string) *modelcatalog.Manager {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "models.json")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("写入模型配置失败: %v", err)
+		}
+		manager, err := modelcatalog.NewManager(path)
+		if err != nil {
+			t.Fatalf("创建目录管理器失败: %v", err)
+		}
+		return manager
+	}
+
+	bedrockOnly := newManager(t, `{"default":"a","models":[{"id":"a"}]}`)
+	providers, err := buildProviders(config.Config{}, bedrockOnly, nil)
+	if err != nil {
+		t.Fatalf("纯 bedrock 目录不应要求 Ark 凭证: %v", err)
+	}
+	if _, exists := providers[llm.ProviderArk]; exists {
+		t.Fatal("未登记 ark 模型时不应装配 ark provider")
+	}
+	if _, exists := providers[llm.ProviderBedrock]; !exists {
+		t.Fatal("bedrock provider 必须始终装配")
+	}
+
+	withArk := newManager(t, `{"default":"a","models":[{"id":"a"},{"id":"b","provider":"ark"}]}`)
+	if _, err := buildProviders(config.Config{}, withArk, nil); err == nil ||
+		!strings.Contains(err.Error(), "ARK_API_KEY") {
+		t.Fatalf("登记了 ark 模型却缺凭证时应启动失败: %v", err)
+	}
+
+	providers, err = buildProviders(
+		config.Config{ArkAPIKey: "secret", ArkBaseURL: "https://example.test/api/v3", ArkTimeout: time.Minute},
+		withArk, nil)
+	if err != nil {
+		t.Fatalf("提供凭证后装配失败: %v", err)
+	}
+	if _, exists := providers[llm.ProviderArk]; !exists {
+		t.Fatal("应装配 ark provider")
+	}
+	if _, exists := providers[llm.ProviderBedrock]; !exists {
+		t.Fatal("bedrock provider 必须始终装配")
 	}
 }
 
