@@ -24,8 +24,10 @@ type anthropicRequest struct {
 	} `json:"metadata"`
 	Tools      []anthropicTool `json:"tools"`
 	ToolChoice json.RawMessage `json:"tool_choice"`
-	// thinking 刻意不在这里声明：它只由 WantsThinking 解析，全仓库单一实现。
-	// 这里再留一份字段，就是给「两侧同义判断静默分叉」留门。
+	// thinking 刻意不在这里声明：解析与类型校验都由 parseThinking 一手承担
+	// （WantsThinking 也走它），全仓库单一实现。这里再留一份字段就是给
+	// 「两侧同义判断静默分叉」留门 —— 但删它的同时必须把它原先兼任的类型闸门
+	// 一起搬过去，否则 thinking 类型写错会从 400 退化成静默关掉思考。
 }
 
 // anthropicTool 是 Anthropic 的工具定义，input_schema 原样搬到 OpenAI 的
@@ -122,12 +124,18 @@ func BuildRequest(modelID string, anthropicBody []byte, stream bool) (*ChatReque
 	// Ark 不传 thinking 时默认开启思考，而 Anthropic 协议在客户端未请求时
 	// 不应返回 thinking 块，因此这里始终显式下发。
 	//
-	// 判断**必须**复用 WantsThinking：请求侧（这里）与响应侧（client.go 传给
-	// BuildResponse / NewEventEmitter 的 includeThinking）各写一份同义判断时，两侧可以
-	// 静默分叉而九个包全绿，后果是请求侧开思考、响应侧丢弃 thinking 块 —— 用户为被扔掉的
-	// reasoning 付费。配对断言见 TestBuildRequestThinkingMatchesWantsThinking。
+	// 判断**必须**走 parseThinking（WantsThinking 也走它）：请求侧（这里）与响应侧
+	// （client.go 传给 BuildResponse / NewEventEmitter 的 includeThinking）各写一份同义
+	// 判断时，两侧可以静默分叉而九个包全绿，后果是请求侧开思考、响应侧丢弃 thinking 块 ——
+	// 用户为被扔掉的 reasoning 付费。配对断言见 TestBuildRequestThinkingMatchesWantsThinking。
+	//
+	// 同一个调用还兼作类型闸门：thinking 写成对象以外的形态要报 400，不能静默当成没开。
+	wantsThinking, thinkingRejection := parseThinking(anthropicBody)
+	if thinkingRejection != nil {
+		return nil, thinkingRejection
+	}
 	request.Thinking = &Thinking{Type: "disabled"}
-	if WantsThinking(anthropicBody) {
+	if wantsThinking {
 		request.Thinking.Type = "enabled"
 	}
 

@@ -268,8 +268,10 @@ func TestInvokeNormalizesTrailingSlashInBaseURL(t *testing.T) {
 		[]byte(`{"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`)); err != nil {
 		t.Fatalf("Invoke 失败: %v", err)
 	}
-	if path := <-paths; path != completionsPath {
-		t.Fatalf("请求路径 = %q，BaseURL 带尾斜杠时不应拼出双斜杠", path)
+	// 路径写字面量而不是 completionsPath：拿实现常量当期望值时把它改成 "/wrong"
+	// 也全绿，而这个路径是 Ark 的对外契约。
+	if path := <-paths; path != "/chat/completions" {
+		t.Fatalf("请求路径 = %q，期望 /chat/completions（BaseURL 带尾斜杠时不应拼出双斜杠）", path)
 	}
 }
 

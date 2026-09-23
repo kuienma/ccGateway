@@ -208,35 +208,59 @@ const realToolCost = 397 - 89
 const realToolDefinition = `{"name":"get_weather","description":"查询指定城市的天气",` +
 	`"input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}`
 
+// marginalToolTokens 返回「同一请求带 count 个 realToolDefinition 后多出来的估算量」。
+//
+// 与 marginalTokens 同一条理由，而且这条理由是被实测打过脸的：本轮初版的
+// TestEstimateTokensScalesToolCostWithCount 用**绝对值**比较，reviewer 把
+// perRequestOverhead 从 80 调到 1000 之后它确实失败了 —— 但是以**错误的理由**失败，
+// 报「工具成本不随数量增长」，而工具模型一行都没动。
+// 「失败」不等于「因为对的理由失败」，所以工具那一路的断言同样必须走增量。
+func marginalToolTokens(t *testing.T, count int) int {
+	t.Helper()
+
+	const messages = `"messages":[{"role":"user","content":"hi"}]`
+	baseline, err := EstimateTokens([]byte(`{"max_tokens":8,` + messages + `}`))
+	if err != nil {
+		t.Fatalf("估算基线失败: %v", err)
+	}
+
+	tools := make([]string, count)
+	for i := range tools {
+		tools[i] = realToolDefinition
+	}
+	loaded, err := EstimateTokens([]byte(`{"max_tokens":8,` + messages +
+		`,"tools":[` + strings.Join(tools, ",") + `]}`))
+	if err != nil {
+		t.Fatalf("估算失败: %v", err)
+	}
+	return int(loaded - baseline)
+}
+
 // TestEstimateTokensMatchesRealToolCost 把真机观测直接变成断言：一个工具定义的估算
-// **增量**必须 >= 实测的 308 token。
+// 增量必须**落在** [308, 616] 这个区间内。
 //
-// 这是整个工具那一路唯一真正的护栏，也是本任务最贵的一条教训。之前的版本只断言
-// 「工具定义比普通文本贵」，那是个**方向对、量级错**的护栏：实测增量只有 43，是真实值的
-// 1/7.2；换成 Claude Code 常态的十几个工具，估算只有真实值的约 39% —— 正落在
-// 「必须偏向高估」要避免的那一侧，而当时全部用例都是绿的。
+// 下界 = 实测的 308。这是整个工具那一路最重要的护栏，也是本任务最贵的一条教训：
+// 初版只断言「工具定义比普通文本贵」，那是个**方向对、量级错**的护栏 —— 实测增量只有 43，
+// 是真实值的 1/7.2；换成 Claude Code 常态的十几个工具，估算只有真实值的约 39%，
+// 正落在「必须偏向高估」要避免的那一侧，而当时全部用例都是绿的。
 //
-// 用增量而不是绝对值，理由同 marginalTokens：绝对值里含 perRequestOverhead，
-// 会把断言变成空的。
+// 上界 = 实测的 2 倍。高估是安全方向，但**不是没有代价**：把 perToolOverhead 调到
+// 10 倍（3000）时九个包全绿，而那会让 Claude Code 误判上下文快满、提前截断或触发压缩。
+// 只有下界就是「半边护栏」—— 本项目反复出现的形状，成本只有一条断言。
 func TestEstimateTokensMatchesRealToolCost(t *testing.T) {
 	t.Parallel()
 
-	const messages = `"messages":[{"role":"user","content":"hi"}]`
-	bare, err := EstimateTokens([]byte(`{"max_tokens":8,` + messages + `}`))
-	if err != nil {
-		t.Fatalf("估算失败: %v", err)
-	}
-	tooled, err := EstimateTokens([]byte(`{"max_tokens":8,` + messages +
-		`,"tools":[` + realToolDefinition + `]}`))
-	if err != nil {
-		t.Fatalf("估算失败: %v", err)
-	}
-
-	if got := int(tooled - bare); got < realToolCost {
+	got := marginalToolTokens(t, 1)
+	if got < realToolCost {
 		t.Fatalf("单个工具定义的估算增量 %d 低于真机实测的 %d token："+
 			"工具成本结构上不是按字符长度走的（那份定义只有 77 个字符），"+
 			"主体是模板为每个工具展开声明的固定开销，必须按固定成本建模并保证高估",
 			got, realToolCost)
+	}
+	if ceiling := realToolCost * 2; got > ceiling {
+		t.Fatalf("单个工具定义的估算增量 %d 超过真机实测 %d 的两倍（上界 %d）："+
+			"高估虽是安全方向，但过度高估会让 Claude Code 误判上下文快满、"+
+			"提前截断或触发压缩", got, realToolCost, ceiling)
 	}
 }
 
@@ -245,60 +269,14 @@ func TestEstimateTokensMatchesRealToolCost(t *testing.T) {
 func TestEstimateTokensScalesToolCostWithCount(t *testing.T) {
 	t.Parallel()
 
-	const messages = `"messages":[{"role":"user","content":"hi"}]`
-	one, err := EstimateTokens([]byte(`{"max_tokens":8,` + messages +
-		`,"tools":[` + realToolDefinition + `]}`))
-	if err != nil {
-		t.Fatalf("估算失败: %v", err)
-	}
-	three, err := EstimateTokens([]byte(`{"max_tokens":8,` + messages +
-		`,"tools":[` + realToolDefinition + `,` + realToolDefinition + `,` + realToolDefinition + `]}`))
-	if err != nil {
-		t.Fatalf("估算失败: %v", err)
-	}
+	one := marginalToolTokens(t, 1)
+	three := marginalToolTokens(t, 3)
 
-	// 三个同样的工具应当花掉约三倍；下界给到 2.5 倍，留出固定项的余量。
-	if int(three) < int(one)*5/2 {
-		t.Fatalf("三个工具的估算 %d 不到单个工具 %d 的 2.5 倍：工具成本必须随数量增长，"+
+	// 三个同样的工具应当花掉约三倍；下界给到 2.5 倍，留出文本项取整的余量。
+	if three < one*5/2 {
+		t.Fatalf("三个工具的估算增量 %d 不到单个工具 %d 的 2.5 倍：工具成本必须随数量增长，"+
 			"否则带十几个工具的常态请求会严重低估", three, one)
 	}
-}
-
-// TestEstimateTokensChargesToolDefinitionsDenser 钉住工具定义比同样长度的普通文本更贵。
-//
-// 与上面那条真机锚定断言的分工：这条锁「方向」（工具定义不能按普通散文算），
-// 上面那条锁「量级」。两条都留着 —— 量级那条是新加的，方向这条在系数被调小时更早失败。
-func TestEstimateTokensChargesToolDefinitionsDenser(t *testing.T) {
-	t.Parallel()
-
-	const payload = `{"type":"object","properties":{"city":{"type":"string"}}}`
-	asTool := []byte(`{"max_tokens":8,"messages":[{"role":"user","content":"hi"}],
-		"tools":[{"name":"t","description":"d","input_schema":` + payload + `}]}`)
-	asText := []byte(`{"max_tokens":8,"messages":[{"role":"user","content":"hi"},
-		{"role":"assistant","content":` + string(mustJSONString(payload)) + `}]}`)
-
-	toolCount, err := EstimateTokens(asTool)
-	if err != nil {
-		t.Fatalf("估算失败: %v", err)
-	}
-	textCount, err := EstimateTokens(asText)
-	if err != nil {
-		t.Fatalf("估算失败: %v", err)
-	}
-	if toolCount <= textCount {
-		t.Fatalf("同一段文本作为工具定义的估算 %d 未超过作为普通消息文本的 %d："+
-			"工具定义在模板里还要包一层声明格式，必须按更密的系数计", toolCount, textCount)
-	}
-}
-
-// mustJSONString 把一段文本编成 JSON 字符串字面量，供上面的用例把同样的内容
-// 分别塞进 tools 与 messages。
-func mustJSONString(text string) []byte {
-	encoded, err := json.Marshal(text)
-	if err != nil {
-		panic(err)
-	}
-	return encoded
 }
 
 // TestEstimateTokensCountsToolUseAndToolResultBlocks 钉住多轮工具循环的输入。
@@ -376,6 +354,45 @@ func TestEstimateTokensCountsUnknownBlocksByRawJSON(t *testing.T) {
 	}
 }
 
+// TestEstimateTokensCountsUndecodableBlockByRawJSON 钉住「单个块解码失败」那条回落路径。
+//
+// 它与上面那条（default 分支）走的是不同代码路径：这里块本身不是对象、连
+// anthropicBlock 都解不进去。把该分支改成零贡献时九个包全绿，而被零掉的可能正是
+// 多轮工具循环里最大的那个 tool_result —— 恰是 Claude Code 的主要形态。
+func TestEstimateTokensCountsUndecodableBlockByRawJSON(t *testing.T) {
+	t.Parallel()
+
+	// 块是字符串而不是对象：json.Unmarshal 进 anthropicBlock 必然失败。
+	payload := strings.Repeat("undecodable-block-payload-", 40)
+	body := []byte(`{"max_tokens":8,"messages":[{"role":"user","content":[` +
+		string(mustJSONString(payload)) + `]}]}`)
+	bare := []byte(`{"max_tokens":8,"messages":[{"role":"user","content":[]}]}`)
+
+	bareCount, err := EstimateTokens(bare)
+	if err != nil {
+		t.Fatalf("估算失败: %v", err)
+	}
+	withBlock, err := EstimateTokens(body)
+	if err != nil {
+		t.Fatalf("估算失败: %v", err)
+	}
+
+	floor := len(payload) / 3
+	if got := int(withBlock - bareCount); got < floor {
+		t.Fatalf("解码失败的块其估算增量 %d 低于其原始 JSON 的文本量下界 %d —— "+
+			"该回落路径必须按原始 JSON 计入，零贡献会让最大的那块输入凭空消失", got, floor)
+	}
+}
+
+// mustJSONString 把一段文本编成 JSON 字符串字面量。
+func mustJSONString(text string) []byte {
+	encoded, err := json.Marshal(text)
+	if err != nil {
+		panic(err)
+	}
+	return encoded
+}
+
 func TestEstimateTokensRejectsMalformedBody(t *testing.T) {
 	t.Parallel()
 
@@ -414,6 +431,12 @@ func TestWantsThinking(t *testing.T) {
 // 后果是静默花钱：请求侧下发 thinking: enabled、Ark 照旧产出 reasoning_content 并计费，
 // 响应侧却把 thinking 块丢掉，用户为被扔掉的 reasoning 付费，且现象上完全看不出来。
 // 这是本项目第五次跨路径不一致，所以这条断言必须存在。
+//
+// **这条断言的边界必须写明**：它锁的是「两侧配对」，**锁不住谓词本身**。
+// 把 parseThinking 改成恒真或恒假时两侧同步漂移，`gotEnabled == wantEnabled` 恒成立，
+// 本用例照样是绿的（实测两个方向都绿）。谓词本身由 TestWantsThinking 与
+// TestBuildRequestThinkingPolicy 用**字面量期望值**锁住 —— 这个分工是刻意的，
+// 但不写出来后人会误以为本用例能兜住谓词。
 func TestBuildRequestThinkingMatchesWantsThinking(t *testing.T) {
 	t.Parallel()
 
@@ -448,6 +471,56 @@ func TestBuildRequestThinkingMatchesWantsThinking(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBuildRequestValidatesThinkingType 钉住 thinking 字段的**类型闸门**。
+//
+// 这条是删字段留下的坑：`anthropicRequest.Thinking` 原先除了「第二个 thinking 判断来源」
+// 之外，还顺带承担类型校验 —— 解析整个请求体时 JSON 的类型不匹配会直接让 BuildRequest
+// 返回 400。把字段删掉（为了消掉两份独立谓词）之后，`"thinking":"enabled"` 这种写法
+// 从 400 变成 200 且**静默关掉思考**：客户端以为开了思考，实际没开，没有任何信号。
+//
+// 教训：删掉一个看起来冗余的东西之前，要确认它的**全部**职责，而不只是最显眼的那个。
+func TestBuildRequestValidatesThinkingType(t *testing.T) {
+	t.Parallel()
+
+	const messages = `"messages":[{"role":"user","content":"hi"}]`
+
+	// 类型写错 → 必须 400，不能静默当成「没请求思考」。
+	badCases := []struct {
+		name string
+		body string
+	}{
+		{"字符串", `{"max_tokens":8,` + messages + `,"thinking":"enabled"}`},
+		{"数字", `{"max_tokens":8,` + messages + `,"thinking":123}`},
+		{"数组", `{"max_tokens":8,` + messages + `,"thinking":["enabled"]}`},
+		{"布尔", `{"max_tokens":8,` + messages + `,"thinking":true}`},
+	}
+	for _, tc := range badCases {
+		t.Run("类型错/"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, rejection := BuildRequest("m", []byte(tc.body), false)
+			if rejection == nil {
+				t.Fatal("thinking 类型写错必须报错：静默关掉思考会让客户端以为开了思考而毫无信号")
+			}
+			if rejection.Kind != "invalid_request_error" {
+				t.Fatalf("Rejection.Kind = %q，期望 invalid_request_error", rejection.Kind)
+			}
+		})
+	}
+
+	// 类型正确 → 必须照常开启思考（反向配对：光会报错不算对，不能把合法请求也拒了）。
+	t.Run("类型对/正常开启", func(t *testing.T) {
+		t.Parallel()
+		body := []byte(`{"max_tokens":8,` + messages + `,"thinking":{"type":"enabled","budget_tokens":1024}}`)
+		req, rejection := BuildRequest("m", body, false)
+		if rejection != nil {
+			t.Fatalf("合法的 thinking 对象不应被拒: %v", rejection)
+		}
+		if req.Thinking == nil || req.Thinking.Type != "enabled" {
+			t.Fatalf("thinking 应下发 enabled，实际 %#v", req.Thinking)
+		}
+	})
 }
 
 func TestBuildRequestClampsMaxTokens(t *testing.T) {

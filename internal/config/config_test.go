@@ -94,23 +94,26 @@ func TestLoadFromLookupUsesDefaults(t *testing.T) {
 		t.Fatalf("加载配置失败: %v", err)
 	}
 
-	if cfg.ListenAddr != DefaultListenAddr {
-		t.Fatalf("ListenAddr = %q", cfg.ListenAddr)
+	// 期望值一律写字面量，不用 Default* 常量：拿实现自己的常量当期望值是同义反复 ——
+	// 常量取任何值断言都成立，等于这些默认值完全没有护栏（实测把 DefaultArkTimeout
+	// 改成 1ns 时九个包全绿）。默认值是对外承诺的行为，本身就该被钉在用例里。
+	if cfg.ListenAddr != ":8080" {
+		t.Fatalf("ListenAddr = %q，期望 \":8080\"", cfg.ListenAddr)
 	}
-	if cfg.ModelConfigFile != DefaultModelConfigFile {
-		t.Fatalf("ModelConfigFile = %q", cfg.ModelConfigFile)
+	if cfg.ModelConfigFile != "configs/models.json" {
+		t.Fatalf("ModelConfigFile = %q，期望 \"configs/models.json\"", cfg.ModelConfigFile)
 	}
-	if cfg.MaxBodyBytes != DefaultMaxBodyBytes {
-		t.Fatalf("MaxBodyBytes = %d", cfg.MaxBodyBytes)
+	if cfg.MaxBodyBytes != 20<<20 {
+		t.Fatalf("MaxBodyBytes = %d，期望 20MiB", cfg.MaxBodyBytes)
 	}
-	if cfg.StreamHeartbeatInterval != DefaultStreamHeartbeatInterval {
-		t.Fatalf("StreamHeartbeatInterval = %s", cfg.StreamHeartbeatInterval)
+	if cfg.StreamHeartbeatInterval != 15*time.Second {
+		t.Fatalf("StreamHeartbeatInterval = %s，期望 15s", cfg.StreamHeartbeatInterval)
 	}
-	if cfg.MaxConcurrentStreams != DefaultMaxConcurrentStreams {
-		t.Fatalf("MaxConcurrentStreams = %d", cfg.MaxConcurrentStreams)
+	if cfg.MaxConcurrentStreams != 4 {
+		t.Fatalf("MaxConcurrentStreams = %d，期望 4", cfg.MaxConcurrentStreams)
 	}
-	if cfg.StreamQueueTimeout != DefaultStreamQueueTimeout {
-		t.Fatalf("StreamQueueTimeout = %s", cfg.StreamQueueTimeout)
+	if cfg.StreamQueueTimeout != 30*time.Second {
+		t.Fatalf("StreamQueueTimeout = %s，期望 30s", cfg.StreamQueueTimeout)
 	}
 }
 
@@ -258,14 +261,16 @@ func TestLoadFromLookupArkDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("加载配置失败: %v", err)
 	}
-	if cfg.ArkBaseURL != DefaultArkBaseURL {
-		t.Fatalf("ArkBaseURL = %q", cfg.ArkBaseURL)
+	// 同上：期望值写字面量，避免同义反复。Ark 的 base URL 与超时是运维会直接依赖的
+	// 对外承诺，拿 Default* 常量当期望值时改坏它们不会有任何用例失败。
+	if cfg.ArkBaseURL != "https://ark.cn-beijing.volces.com/api/v3" {
+		t.Fatalf("ArkBaseURL = %q，期望 Ark 北京站的 /api/v3", cfg.ArkBaseURL)
 	}
 	if cfg.ArkAPIKey != "" {
 		t.Fatal("未设置 ARK_API_KEY 时应为空而不是报错")
 	}
-	if cfg.ArkTimeout != DefaultArkTimeout {
-		t.Fatalf("ArkTimeout = %v", cfg.ArkTimeout)
+	if cfg.ArkTimeout != 120*time.Second {
+		t.Fatalf("ArkTimeout = %v，期望 120s", cfg.ArkTimeout)
 	}
 }
 

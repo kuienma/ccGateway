@@ -255,10 +255,13 @@ func TestEventEmitterThinkingThenToolUse(t *testing.T) {
 		t.Fatalf("Finish 失败: %v", err)
 	}
 
-	if log.events[1]["content_block"].(map[string]any)["type"] != blockKindThinking {
+	// 块类型写字面量而不是 blockKind* 常量：那些常量是实现自己的，拿它们当期望值时
+	// 把常量改成 "thinkng" 也不会有任何用例失败，而这两个字符串是 Anthropic 的线格式、
+	// 客户端按它们分派 —— 必须钉死。
+	if log.events[1]["content_block"].(map[string]any)["type"] != "thinking" {
 		t.Fatal("thinking 块必须排在 tool_use 之前")
 	}
-	if log.events[4]["content_block"].(map[string]any)["type"] != blockKindToolUse {
+	if log.events[4]["content_block"].(map[string]any)["type"] != "tool_use" {
 		t.Fatalf("第二块应为 tool_use，实际 %#v", log.events[4]["content_block"])
 	}
 }

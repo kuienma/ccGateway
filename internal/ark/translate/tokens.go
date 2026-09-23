@@ -169,15 +169,48 @@ func estimateTextTokens(text string) int {
 //
 // 只认 thinking.type == "enabled"，其余（含完全不传）一律为假：Ark 不传 thinking
 // 时默认开启思考，而 Anthropic 协议在客户端未请求时不应返回 thinking 块。
-// 请求体畸形时返回 false —— 真正的报错由 BuildRequest 负责。
+// 请求体畸形、或 thinking 字段类型写错时返回 false —— **报错由 BuildRequest 负责**，
+// 它走同一个 parseThinking 拿 Rejection，见下。
 func WantsThinking(anthropicBody []byte) bool {
-	var source struct {
-		Thinking *struct {
-			Type string `json:"type"`
-		} `json:"thinking"`
+	enabled, _ := parseThinking(anthropicBody)
+	return enabled
+}
+
+// parseThinking 是全仓库唯一一份 thinking 字段的解析实现，同时承担两件事：
+//   - 语义：客户端是否显式请求了 thinking（WantsThinking 与 BuildRequest 共用）；
+//   - 类型闸门：thinking 写成对象以外的形态时给出 Rejection（BuildRequest 用）。
+//
+// 这两件事必须在同一个函数里。历史教训：
+//   - 最初请求侧内联判断、响应侧另写 WantsThinking，两份独立实现可以静默分叉，
+//     后果是请求侧开思考、响应侧丢弃 thinking 块，用户为被扔掉的 reasoning 付费；
+//   - 于是把请求侧改成复用 WantsThinking，并删掉 anthropicRequest 里的 thinking 字段。
+//     但那个字段除了「第二个判断来源」之外还有个不显眼的职责：**类型校验**。
+//     删掉之后 `"thinking":"enabled"`（本该是对象却写成字符串）从 400 变成 200 且
+//     静默关掉思考 —— 客户端以为开了思考，实际没开，没有任何信号。
+//
+// 所以现在由这一个函数同时给出「是否开启」与「类型是否合法」，两个职责都不再有第二份实现。
+func parseThinking(anthropicBody []byte) (bool, *Rejection) {
+	// 先用 RawMessage 接住：它对任何合法 JSON 都不报错，于是「整个请求体不是对象」
+	// 与「thinking 字段类型不对」两种情况可以分开处理。
+	var probe struct {
+		Thinking json.RawMessage `json:"thinking"`
 	}
-	if err := json.Unmarshal(anthropicBody, &source); err != nil {
-		return false
+	if err := json.Unmarshal(anthropicBody, &probe); err != nil {
+		// 整个请求体都不是 JSON 对象：由 BuildRequest 开头那条统一检查报错，
+		// 这里不抢它的措辞。
+		return false, nil
 	}
-	return source.Thinking != nil && source.Thinking.Type == "enabled"
+
+	trimmed := strings.TrimSpace(string(probe.Thinking))
+	if trimmed == "" || trimmed == "null" {
+		return false, nil
+	}
+
+	var thinking struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(probe.Thinking, &thinking); err != nil {
+		return false, &Rejection{Kind: kindInvalidRequest, Message: "thinking 必须是对象"}
+	}
+	return thinking.Type == "enabled", nil
 }
