@@ -121,7 +121,7 @@ func (c *Client) Invoke(ctx context.Context, modelID string, body []byte) ([]byt
 	// error 而不是 rejectionError，让 httpapi 兜底成 5xx / api_error。
 	// includeThinking 由请求是否显式开启 thinking 决定，见 Task 11；
 	// 当前阶段固定不透出 thinking 块。
-	return translate.BuildResponse(payload, false)
+	return translate.BuildResponse(payload, modelID, false)
 }
 
 // post 完成请求转换并发起 HTTP 调用，调用方负责关闭 Body。

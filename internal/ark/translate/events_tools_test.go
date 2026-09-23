@@ -1,6 +1,9 @@
 package translate
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // toolStartChunk 是工具首发分片：带 id、name 与空 arguments。
 func toolStartChunk(toolIndex int, id, name string) StreamChunk {
@@ -334,6 +337,41 @@ func TestEventEmitterOrphanArgumentFragmentFails(t *testing.T) {
 	}
 }
 
+// TestEventEmitterOrphanArgumentFragmentCollidingWithOpenBlockFails 是孤儿分片守卫的真正护栏。
+//
+// 上一条用例用的是 tool index 0 且当时没有任何块打开，所以即使删掉 toolBlocks 的 ok 判定，
+// 零值 0 也会被下游的交错检查顺手兜住（只是错误信息退化成误导性的「存在交错」），用例照样绿。
+//
+// 本用例构造真正的碰撞：先用上游 tool index 3 开块（它映射成 block index 0），
+// 再投一个 tool index 0 的孤儿分片 —— 此时 toolBlocks[0] 的零值 0 恰好等于当前 openIndex 0，
+// 交错检查会放行，孤儿参数被静默写进工具 3 的块，零报错。
+// 因此这里既断言必须报错，也断言错误必须出自「缺少首发分片」那条守卫，
+// 而不是被交错检查误报。
+func TestEventEmitterOrphanArgumentFragmentCollidingWithOpenBlockFails(t *testing.T) {
+	t.Parallel()
+
+	log := &eventLog{}
+	emitter := NewEventEmitter("m", false, log.emit)
+
+	// 上游 tool index 3 → Anthropic block index 0。
+	if err := emitter.Consume(toolStartChunk(3, "call_3", "f")); err != nil {
+		t.Fatalf("Consume 失败: %v", err)
+	}
+	before := len(log.ofType(t, "content_block_delta"))
+
+	// tool index 0 从未有过首发分片：它的映射不存在，绝不能借用零值落到别人的块上。
+	err := emitter.Consume(toolArgChunk(0, `{"a":1}`))
+	if err == nil {
+		t.Fatal("与已打开块 index 碰撞的孤儿参数分片必须报错，不能静默写进别的工具块")
+	}
+	if !strings.Contains(err.Error(), "缺少首发分片") {
+		t.Fatalf("错误应出自缺少首发分片的守卫，实际 %v", err)
+	}
+	if after := len(log.ofType(t, "content_block_delta")); after != before {
+		t.Fatalf("报错前不得写出任何参数 delta，delta 数从 %d 变成 %d", before, after)
+	}
+}
+
 func TestEventEmitterInterleavedToolFragmentsFail(t *testing.T) {
 	t.Parallel()
 
@@ -388,6 +426,30 @@ func TestEventEmitterIncompleteToolStartFails(t *testing.T) {
 	}
 	if err := emitter.Consume(chunk); err == nil {
 		t.Fatal("缺 name 的工具首发分片必须报错")
+	}
+}
+
+// TestEventEmitterToolStartWithoutIDFails 是上一条的镜像。
+//
+// openToolBlock 的守卫是 call.ID == "" || call.Function.Name == ""，但此前只有「有 id 没 name」
+// 一条用例，把守卫削成只查 Name 整包测试仍全绿 —— 「有 name 没 id」这个分支无人把守。
+// Anthropic 协议要求 tool_use 块的 id 与 name 双必填，缺 id 的块客户端无法回传结果。
+func TestEventEmitterToolStartWithoutIDFails(t *testing.T) {
+	t.Parallel()
+
+	log := &eventLog{}
+	emitter := NewEventEmitter("m", false, log.emit)
+
+	// 有 name 但没 id 的首发分片：同样无法构造合法的 tool_use 块。
+	call := StreamToolCall{Index: 0, Type: "function"}
+	call.Function.Name = "get_weather"
+	chunk := StreamChunk{
+		ID:      "s1",
+		Model:   "m",
+		Choices: []StreamChoice{{Index: 0, Delta: StreamDelta{ToolCalls: []StreamToolCall{call}}}},
+	}
+	if err := emitter.Consume(chunk); err == nil {
+		t.Fatal("缺 id 的工具首发分片必须报错")
 	}
 }
 

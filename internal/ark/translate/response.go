@@ -75,8 +75,9 @@ func MapStopReason(finishReason string) string {
 }
 
 // BuildResponse 把 Ark 非流式响应转成 Anthropic 响应。
+// modelID 是网关本次请求的模型名，仅在上游不回显 model 时作为回落值使用。
 // includeThinking 为真时把 reasoning_content 作为 thinking 块透出（排在最前）。
-func BuildResponse(payload []byte, includeThinking bool) ([]byte, error) {
+func BuildResponse(payload []byte, modelID string, includeThinking bool) ([]byte, error) {
 	var source ChatResponse
 	if err := json.Unmarshal(payload, &source); err != nil {
 		return nil, fmt.Errorf("解析 Ark 响应: %w", err)
@@ -86,12 +87,20 @@ func BuildResponse(payload []byte, includeThinking bool) ([]byte, error) {
 	}
 	choice := source.Choices[0]
 
+	// model 以上游回显值为准，与流式 ensureStarted 同一取值来源：万一 Ark 做模型路由或降级，
+	// 两条路径都会如实报告实际模型，而不是我们请求的那个。
+	// 上游没回显时回落到传入的 modelID，避免客户端收到 "model":""。
+	model := source.Model
+	if model == "" {
+		model = modelID
+	}
+
 	result := anthropicResponse{
 		// 与流式路径共用 newMessageID，确保两条路径给客户端的 id 形态一致。
 		ID:         newMessageID(source.ID),
 		Type:       "message",
 		Role:       "assistant",
-		Model:      source.Model,
+		Model:      model,
 		StopReason: MapStopReason(choice.FinishReason),
 	}
 	if source.Usage != nil {
@@ -116,6 +125,14 @@ func BuildResponse(payload []byte, includeThinking bool) ([]byte, error) {
 		})
 	}
 	for index, call := range choice.Message.ToolCalls {
+		// Anthropic 要求 tool_use 块的 id 与 name 双必填，而下面 responseBlock 的 ID / Name
+		// 两个字段都带 omitempty：上游给空 id 或空 name 时，那个字段会在序列化结果里整个
+		// 消失，客户端拿到一个无法执行、也无法回传结果的 tool_use 块，而网关一声不响。
+		// 这里硬失败而不是填占位符 —— 宁可报错，也不要把损坏数据转发给客户端。
+		// 与流式 openToolBlock 的守卫是同一条语义，两条路径必须一致。
+		if call.ID == "" || call.Function.Name == "" {
+			return nil, fmt.Errorf("tool_calls[%d] 缺少 id 或 name", index)
+		}
 		input := json.RawMessage(call.Function.Arguments)
 		if len(input) == 0 {
 			input = json.RawMessage("{}")

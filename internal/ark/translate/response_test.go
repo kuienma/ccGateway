@@ -21,6 +21,11 @@ const arkTextResponse = `{
 		"completion_tokens_details": {"reasoning_tokens": 9}}
 }`
 
+// gatewayModelID 是网关请求时传入的 modelID，刻意与各用例上游回显的 model 都不相同：
+// 这样凡是断言 model 的用例都同时钉住了「有回显时以上游回显值为准」，
+// 回落逻辑写成无条件覆盖也会被抓出来。
+const gatewayModelID = "gateway-requested-model"
+
 func decodeAnthropicResponse(t *testing.T, payload []byte) map[string]any {
 	t.Helper()
 	var decoded map[string]any
@@ -33,7 +38,7 @@ func decodeAnthropicResponse(t *testing.T, payload []byte) map[string]any {
 func TestBuildResponseMapsTextAndUsage(t *testing.T) {
 	t.Parallel()
 
-	out, err := BuildResponse([]byte(arkTextResponse), false)
+	out, err := BuildResponse([]byte(arkTextResponse), gatewayModelID, false)
 	if err != nil {
 		t.Fatalf("转换失败: %v", err)
 	}
@@ -74,10 +79,31 @@ func TestBuildResponseMapsTextAndUsage(t *testing.T) {
 	}
 }
 
+// TestBuildResponseFallsBackToModelIDWhenUpstreamOmitsModel 钉住非流式的 model 空值回落。
+//
+// 流式 ensureStarted 早就有这条回落（chunk.Model 为空则用传入的 modelID），非流式一直没有，
+// 上游若不回显 model，客户端就收到 "model":""。两条路径必须同口径。
+func TestBuildResponseFallsBackToModelIDWhenUpstreamOmitsModel(t *testing.T) {
+	t.Parallel()
+
+	// 上游响应不带 model 字段。
+	payload := `{"id":"r","choices":[{"finish_reason":"stop",
+		"message":{"role":"assistant","content":"ok"}}],
+		"usage":{"prompt_tokens":1,"completion_tokens":1}}`
+
+	out, err := BuildResponse([]byte(payload), gatewayModelID, false)
+	if err != nil {
+		t.Fatalf("转换失败: %v", err)
+	}
+	if got := decodeAnthropicResponse(t, out)["model"]; got != gatewayModelID {
+		t.Fatalf("上游不回显 model 时应回落到传入的 modelID %q，实际 %v", gatewayModelID, got)
+	}
+}
+
 func TestBuildResponseEmitsThinkingBlockFirst(t *testing.T) {
 	t.Parallel()
 
-	out, err := BuildResponse([]byte(arkTextResponse), true)
+	out, err := BuildResponse([]byte(arkTextResponse), gatewayModelID, true)
 	if err != nil {
 		t.Fatalf("转换失败: %v", err)
 	}
@@ -114,7 +140,7 @@ func TestBuildResponseMapsToolCalls(t *testing.T) {
 		"usage": {"completion_tokens": 20, "prompt_tokens": 100}
 	}`
 
-	out, err := BuildResponse([]byte(payload), false)
+	out, err := BuildResponse([]byte(payload), gatewayModelID, false)
 	if err != nil {
 		t.Fatalf("转换失败: %v", err)
 	}
@@ -155,7 +181,7 @@ func TestBuildResponseStopReasonMapping(t *testing.T) {
 			t.Parallel()
 			payload := `{"id":"r","model":"m","choices":[{"finish_reason":"` + tc.finish +
 				`","message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`
-			out, err := BuildResponse([]byte(payload), false)
+			out, err := BuildResponse([]byte(payload), gatewayModelID, false)
 			if err != nil {
 				t.Fatalf("转换失败: %v", err)
 			}
@@ -169,7 +195,7 @@ func TestBuildResponseStopReasonMapping(t *testing.T) {
 func TestBuildResponseRejectsEmptyChoices(t *testing.T) {
 	t.Parallel()
 
-	if _, err := BuildResponse([]byte(`{"id":"r","model":"m","choices":[]}`), false); err == nil {
+	if _, err := BuildResponse([]byte(`{"id":"r","model":"m","choices":[]}`), gatewayModelID, false); err == nil {
 		t.Fatal("choices 为空必须报错，不能返回空响应给客户端")
 	}
 }
@@ -182,7 +208,7 @@ func TestBuildResponseKeepsMalformedToolArgumentsVisible(t *testing.T) {
 			{"id":"c1","type":"function","function":{"name":"f","arguments":"{不是JSON"}}]}}],
 		"usage":{"prompt_tokens":1,"completion_tokens":1}}`
 
-	if _, err := BuildResponse([]byte(payload), false); err == nil {
+	if _, err := BuildResponse([]byte(payload), gatewayModelID, false); err == nil {
 		t.Fatal("工具参数不是合法 JSON 时必须报错，不能静默产出损坏的 input")
 	}
 }
@@ -199,6 +225,51 @@ func toolArgumentsResponse(t *testing.T, arguments string) []byte {
 		`"message":{"role":"assistant","content":"","tool_calls":[` +
 		`{"id":"c1","type":"function","function":{"name":"f","arguments":` + string(encoded) + `}}]}}],` +
 		`"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+}
+
+// toolIdentityResponse 造一个只有一个 tool_call 的响应，id 与 name 由调用方指定。
+// 上游给缺字段还是给空串，在 Go 解码后都是空串，两种形态等价。
+func toolIdentityResponse(t *testing.T, id, name string) []byte {
+	t.Helper()
+	encodedID, err := json.Marshal(id)
+	if err != nil {
+		t.Fatalf("构造用例失败: %v", err)
+	}
+	encodedName, err := json.Marshal(name)
+	if err != nil {
+		t.Fatalf("构造用例失败: %v", err)
+	}
+	return []byte(`{"id":"r","model":"m","choices":[{"finish_reason":"tool_calls",` +
+		`"message":{"role":"assistant","content":"","tool_calls":[` +
+		`{"id":` + string(encodedID) + `,"type":"function","function":{"name":` + string(encodedName) +
+		`,"arguments":"{}"}}]}}],` +
+		`"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+}
+
+// TestBuildResponseRejectsToolCallWithoutID 钉住非流式 tool_use 的 id 必填。
+//
+// Anthropic 协议要求 tool_use 块的 id 与 name 双必填，而 responseBlock 的这两个字段都带
+// omitempty —— 上游给空 id 时，序列化结果里 id 会整个消失，客户端拿到一个无法回传结果的
+// 损坏块，而网关一声不响。与流式 openToolBlock 的硬守卫同一口径：宁可报错，
+// 也不要填占位符把损坏数据转发给客户端。
+func TestBuildResponseRejectsToolCallWithoutID(t *testing.T) {
+	t.Parallel()
+
+	out, err := BuildResponse(toolIdentityResponse(t, "", "get_weather"), gatewayModelID, false)
+	if err == nil {
+		t.Fatalf("tool_calls 缺 id 必须报错，不能产出缺字段的 tool_use 块，实际产出 %s", out)
+	}
+}
+
+// TestBuildResponseRejectsToolCallWithoutName 是上一条的镜像：name 同样必填。
+// 缺 name 的 tool_use 块客户端不知道该执行哪个工具。
+func TestBuildResponseRejectsToolCallWithoutName(t *testing.T) {
+	t.Parallel()
+
+	out, err := BuildResponse(toolIdentityResponse(t, "call_1", ""), gatewayModelID, false)
+	if err == nil {
+		t.Fatalf("tool_calls 缺 name 必须报错，不能产出缺字段的 tool_use 块，实际产出 %s", out)
+	}
 }
 
 // Anthropic 的 tool_use.input 必须是对象。合法但非对象的 JSON（尤其 null）
@@ -219,7 +290,7 @@ func TestBuildResponseRejectsNonObjectToolArguments(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			out, err := BuildResponse(toolArgumentsResponse(t, tc.arguments), false)
+			out, err := BuildResponse(toolArgumentsResponse(t, tc.arguments), gatewayModelID, false)
 			if err == nil {
 				t.Fatalf("arguments=%s 是合法 JSON 但不是对象，必须报错，实际产出 %s", tc.arguments, out)
 			}
@@ -231,7 +302,7 @@ func TestBuildResponseAcceptsObjectToolArguments(t *testing.T) {
 	t.Parallel()
 
 	for _, arguments := range []string{`{}`, `{"city": "北京"}`} {
-		out, err := BuildResponse(toolArgumentsResponse(t, arguments), false)
+		out, err := BuildResponse(toolArgumentsResponse(t, arguments), gatewayModelID, false)
 		if err != nil {
 			t.Fatalf("arguments=%s 是合法对象，不应报错: %v", arguments, err)
 		}
@@ -251,7 +322,7 @@ func TestBuildResponseKeepsEmptyContentAsArray(t *testing.T) {
 		"message":{"role":"assistant","content":""}}],
 		"usage":{"prompt_tokens":1,"completion_tokens":1}}`
 
-	out, err := BuildResponse([]byte(payload), false)
+	out, err := BuildResponse([]byte(payload), gatewayModelID, false)
 	if err != nil {
 		t.Fatalf("转换失败: %v", err)
 	}
@@ -290,7 +361,7 @@ func TestBuildResponseStopReasonOverriddenWhenToolUseBlockPresent(t *testing.T) 
 		"usage": {"completion_tokens": 20, "prompt_tokens": 100}
 	}`
 
-	out, err := BuildResponse([]byte(payload), false)
+	out, err := BuildResponse([]byte(payload), gatewayModelID, false)
 	if err != nil {
 		t.Fatalf("转换失败: %v", err)
 	}
