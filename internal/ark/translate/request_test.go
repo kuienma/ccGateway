@@ -157,6 +157,55 @@ func TestBuildRequestDropsUnsupportedFields(t *testing.T) {
 	}
 }
 
+func TestBuildRequestPassesThroughTopP(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{"max_tokens":64,"top_p":0.25,"messages":[{"role":"user","content":"hi"}]}`)
+
+	req, rejection := BuildRequest("m", raw, false)
+	if rejection != nil {
+		t.Fatalf("不应被拒绝: %v", rejection)
+	}
+	if req.TopP == nil {
+		t.Fatal("top_p 应透传，实际为 nil")
+	}
+	if *req.TopP != 0.25 {
+		t.Fatalf("TopP = %v，期望 0.25", *req.TopP)
+	}
+}
+
+// TestBuildRequestKeepsExplicitZeroTemperature 锁定指针型字段的语义：
+// 客户端显式传 temperature=0 时必须原样下发，不能被 omitempty 静默丢掉。
+func TestBuildRequestKeepsExplicitZeroTemperature(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{"max_tokens":64,"temperature":0,"top_p":0,"messages":[{"role":"user","content":"hi"}]}`)
+
+	req, rejection := BuildRequest("m", raw, false)
+	if rejection != nil {
+		t.Fatalf("不应被拒绝: %v", rejection)
+	}
+	if req.Temperature == nil {
+		t.Fatal("显式传入的 temperature=0 不应被丢弃")
+	}
+	if *req.Temperature != 0 {
+		t.Fatalf("Temperature = %v，期望 0", *req.Temperature)
+	}
+	if req.TopP == nil || *req.TopP != 0 {
+		t.Fatalf("显式传入的 top_p=0 不应被丢弃，实际 %#v", req.TopP)
+	}
+
+	encoded, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("序列化失败: %v", err)
+	}
+	for _, want := range []string{`"temperature":0`, `"top_p":0`} {
+		if !strings.Contains(string(encoded), want) {
+			t.Fatalf("序列化结果应包含 %s: %s", want, encoded)
+		}
+	}
+}
+
 func TestBuildRequestRejectsMalformedBody(t *testing.T) {
 	t.Parallel()
 
