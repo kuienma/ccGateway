@@ -116,9 +116,14 @@ func (e *EventEmitter) ensureStarted(chunk StreamChunk) error {
 	if chunk.ID != "" {
 		e.messageID = "msg_" + chunk.ID
 	}
-	// model 取网关本次请求用的 modelID，而不是某个 chunk 回显的值：message_start 必须在
-	// 流开头就发出，此时只有 modelID 是确定非空的（路由层已解析）。实测 Ark 会把同一个
-	// modelID 原样回显在每个 chunk 的 model 字段里，两者在线上恒等。
+	// model 以上游回显值为准，与非流式 BuildResponse 用 source.Model 保持同一取值来源：
+	// 万一 Ark 做模型路由或降级（比如 GA 快照下线自动切版本），两条路径都会如实报告实际
+	// 模型，而不是我们请求的那个。实测流式 chunk 的 model 原样回显请求的 modelID，
+	// 今天两者恒等。chunk 未带 model 时回落到 modelID，避免客户端收到 "model":""。
+	model := chunk.Model
+	if model == "" {
+		model = e.modelID
+	}
 	// 上游只在流末尾给 usage，这里先填 0，结束时在 message_delta 里补真实值。
 	return e.write(map[string]any{
 		"type": "message_start",
@@ -126,7 +131,7 @@ func (e *EventEmitter) ensureStarted(chunk StreamChunk) error {
 			"id":            e.messageID,
 			"type":          "message",
 			"role":          "assistant",
-			"model":         e.modelID,
+			"model":         model,
 			"content":       []any{},
 			"stop_reason":   nil,
 			"stop_sequence": nil,

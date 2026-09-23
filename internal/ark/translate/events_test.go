@@ -106,8 +106,10 @@ func TestEventEmitterTextOnlySequence(t *testing.T) {
 	if start["role"] != "assistant" || start["type"] != "message" {
 		t.Fatalf("message_start.message = %#v", start)
 	}
-	if start["model"] != "deepseek-v4-flash-ga-260731" {
-		t.Fatalf("model = %v", start["model"])
+	// model 以上游 chunk 回显的值为准（与非流式 BuildResponse 用 source.Model 同源），
+	// 而不是网关请求时传入的 modelID —— 这里 chunk 回显 "m"，就应该吐 "m"。
+	if start["model"] != "m" {
+		t.Fatalf("model 应取上游回显值 \"m\"，实际 %v", start["model"])
 	}
 	if start["id"] == "" || start["id"] == nil {
 		t.Fatal("message_start 必须带 id")
@@ -136,6 +138,34 @@ func TestEventEmitterTextOnlySequence(t *testing.T) {
 	}
 	if usage["input_tokens"].(float64) != 10 {
 		t.Fatalf("message_delta 应补上真实 input_tokens，实际 %v", usage["input_tokens"])
+	}
+}
+
+func TestEventEmitterFallsBackToModelIDWhenChunkOmitsModel(t *testing.T) {
+	t.Parallel()
+
+	log := &eventLog{}
+	emitter := NewEventEmitter("deepseek-v4-flash-ga-260731", false, log.emit)
+
+	// 首个 chunk 不带 model 字段：必须回落到网关传入的 modelID。
+	// 少了这条回落，客户端会收到 "model":""。
+	noModel := StreamChunk{
+		ID:      "s1",
+		Choices: []StreamChoice{{Index: 0, Delta: StreamDelta{Role: "assistant", Content: "答"}}},
+	}
+	if err := emitter.Consume(noModel); err != nil {
+		t.Fatalf("Consume 失败: %v", err)
+	}
+	if err := emitter.Consume(finishChunk("stop", 1, 1)); err != nil {
+		t.Fatalf("Consume 失败: %v", err)
+	}
+	if err := emitter.Finish(true); err != nil {
+		t.Fatalf("Finish 失败: %v", err)
+	}
+
+	start := log.events[0]["message"].(map[string]any)
+	if start["model"] != "deepseek-v4-flash-ga-260731" {
+		t.Fatalf("chunk 未带 model 时应回落到 modelID，实际 %#v", start["model"])
 	}
 }
 
