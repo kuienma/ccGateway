@@ -43,8 +43,8 @@ func TestManagerConcurrentReadersAcrossReloads(t *testing.T) {
 					return
 				default:
 				}
-				if id, ok := manager.Resolve("current"); !ok || (id != "a" && id != "b") {
-					t.Errorf("读取到非完整快照: %q %v", id, ok)
+				if id, ok := manager.Resolve("current"); !ok || (id.ModelID != "a" && id.ModelID != "b") {
+					t.Errorf("读取到非完整快照: %q %v", id.ModelID, ok)
 					return
 				}
 			}
@@ -66,7 +66,7 @@ func TestManagerConcurrentReadersAcrossReloads(t *testing.T) {
 		}
 	}
 	stopReaders()
-	if id, ok := old.Resolve("current"); !ok || id != "a" {
+	if id, ok := old.Resolve("current"); !ok || id.ModelID != "a" {
 		t.Fatal("旧快照被修改")
 	}
 	// 只改动测试创建的临时文件；读取失败也不能清空当前快照。
@@ -96,8 +96,8 @@ func TestParseWhitespaceAndTrailingData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if id, ok := catalog.Resolve(" alias "); !ok || id != "arbitrary-model" {
-		t.Fatalf("id=%q ok=%v", id, ok)
+	if id, ok := catalog.Resolve(" alias "); !ok || id.ModelID != "arbitrary-model" {
+		t.Fatalf("id=%q ok=%v", id.ModelID, ok)
 	}
 	for _, raw := range []string{good + `{}`, good + `x`, `null`, `{"default":"x","models":[{"id":" "}]}`, `{"default":"x","models":[{"id":"x","aliases":[" "]}]}`, `{"default":"x","models":[{"id":"x","aliases":[" x "]}]}`} {
 		if _, err := Parse([]byte(raw)); err == nil {
@@ -119,8 +119,8 @@ func TestManagerReloadKeepsPreviousSnapshotOnFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("创建目录管理器失败: %v", err)
 	}
-	if resolved, ok := manager.Resolve("a"); !ok || resolved != "model-a" {
-		t.Fatalf("初始目录解析异常: %q, %v", resolved, ok)
+	if resolved, ok := manager.Resolve("a"); !ok || resolved.ModelID != "model-a" {
+		t.Fatalf("初始目录解析异常: %q, %v", resolved.ModelID, ok)
 	}
 
 	if err := os.WriteFile(path, []byte(`{"default":"missing","models":[{"id":"model-b"}]}`), 0o600); err != nil {
@@ -129,8 +129,8 @@ func TestManagerReloadKeepsPreviousSnapshotOnFailure(t *testing.T) {
 	if err := manager.Reload(); err == nil {
 		t.Fatal("预期 reload 失败")
 	}
-	if resolved, ok := manager.Resolve("a"); !ok || resolved != "model-a" {
-		t.Fatalf("失败 reload 后旧快照丢失: %q, %v", resolved, ok)
+	if resolved, ok := manager.Resolve("a"); !ok || resolved.ModelID != "model-a" {
+		t.Fatalf("失败 reload 后旧快照丢失: %q, %v", resolved.ModelID, ok)
 	}
 
 	updated := []byte(`{"default":"model-b","models":[{"id":"model-b","aliases":["b"]}]}`)
@@ -140,7 +140,7 @@ func TestManagerReloadKeepsPreviousSnapshotOnFailure(t *testing.T) {
 	if err := manager.Reload(); err != nil {
 		t.Fatalf("reload 新目录失败: %v", err)
 	}
-	if resolved, ok := manager.Resolve(""); !ok || resolved != "model-b" {
-		t.Fatalf("新默认模型未生效: %q, %v", resolved, ok)
+	if resolved, ok := manager.Resolve(""); !ok || resolved.ModelID != "model-b" {
+		t.Fatalf("新默认模型未生效: %q, %v", resolved.ModelID, ok)
 	}
 }

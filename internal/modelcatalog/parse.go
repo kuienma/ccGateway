@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
 )
 
 type fileConfig struct {
@@ -14,8 +16,9 @@ type fileConfig struct {
 }
 
 type modelConfig struct {
-	ID      string   `json:"id"`
-	Aliases []string `json:"aliases,omitempty"`
+	ID       string   `json:"id"`
+	Provider string   `json:"provider,omitempty"`
+	Aliases  []string `json:"aliases,omitempty"`
 }
 
 func Parse(data []byte) (*Catalog, error) {
@@ -32,13 +35,22 @@ func Parse(data []byte) (*Catalog, error) {
 		return nil, fmt.Errorf("models 至少包含一个模型")
 	}
 
-	resolutions := make(map[string]string)
+	resolutions := make(map[string]llm.Resolution)
 	for index, model := range raw.Models {
 		model.ID = strings.TrimSpace(model.ID)
 		if model.ID == "" {
 			return nil, fmt.Errorf("models[%d].id 不能为空", index)
 		}
-		if err := registerResolution(resolutions, model.ID, model.ID); err != nil {
+		provider := strings.TrimSpace(model.Provider)
+		if provider == "" {
+			// 缺省 bedrock，保持既有配置文件向后兼容。
+			provider = llm.ProviderBedrock
+		}
+		if !llm.ValidProvider(provider) {
+			return nil, fmt.Errorf("models[%d].provider 未登记: %s", index, provider)
+		}
+		resolution := llm.Resolution{ModelID: model.ID, Provider: provider}
+		if err := registerResolution(resolutions, model.ID, resolution); err != nil {
 			return nil, err
 		}
 		for aliasIndex, alias := range model.Aliases {
@@ -46,25 +58,25 @@ func Parse(data []byte) (*Catalog, error) {
 			if alias == "" {
 				return nil, fmt.Errorf("models[%d].aliases[%d] 不能为空", index, aliasIndex)
 			}
-			if err := registerResolution(resolutions, alias, model.ID); err != nil {
+			if err := registerResolution(resolutions, alias, resolution); err != nil {
 				return nil, err
 			}
 		}
 	}
 
 	defaultName := strings.TrimSpace(raw.Default)
-	defaultModel, ok := resolutions[defaultName]
+	defaultResolution, ok := resolutions[defaultName]
 	if defaultName == "" || !ok {
 		return nil, fmt.Errorf("default 必须引用已登记的模型或别名")
 	}
-	return &Catalog{defaultModel: defaultModel, resolutions: resolutions}, nil
+	return &Catalog{defaultModel: defaultResolution, resolutions: resolutions}, nil
 }
 
-func registerResolution(resolutions map[string]string, name, modelID string) error {
+func registerResolution(resolutions map[string]llm.Resolution, name string, resolution llm.Resolution) error {
 	if _, exists := resolutions[name]; exists {
 		return fmt.Errorf("模型名或别名重复: %s", name)
 	}
-	resolutions[name] = modelID
+	resolutions[name] = resolution
 	return nil
 }
 

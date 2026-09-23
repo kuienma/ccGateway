@@ -1,21 +1,25 @@
 package modelcatalog
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
+)
 
 // Catalog 是只读的模型名称解析快照，由 Parse 构造。
 type Catalog struct {
-	defaultModel string
-	resolutions  map[string]string
+	defaultModel llm.Resolution
+	resolutions  map[string]llm.Resolution
 }
 
-func (c *Catalog) Resolve(name string) (string, bool) {
+func (c *Catalog) Resolve(name string) (llm.Resolution, bool) {
 	if c == nil {
-		return "", false
+		return llm.Resolution{}, false
 	}
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return c.defaultModel, true
 	}
-	modelID, ok := c.resolutions[name]
-	return modelID, ok
+	resolution, ok := c.resolutions[name]
+	return resolution, ok
 }

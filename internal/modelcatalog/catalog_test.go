@@ -2,6 +2,8 @@ package modelcatalog
 
 import (
 	"testing"
+
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
 )
 
 func TestParseAndResolveAliases(t *testing.T) {
@@ -32,8 +34,8 @@ func TestParseAndResolveAliases(t *testing.T) {
 	}
 	for input, expected := range testCases {
 		resolved, ok := catalog.Resolve(input)
-		if !ok || resolved != expected {
-			t.Fatalf("Resolve(%q) = %q, %v", input, resolved, ok)
+		if !ok || resolved.ModelID != expected {
+			t.Fatalf("Resolve(%q) = %q, %v", input, resolved.ModelID, ok)
 		}
 	}
 
@@ -64,5 +66,57 @@ func TestParseRejectsInvalidCatalog(t *testing.T) {
 				t.Fatal("预期模型目录校验失败")
 			}
 		})
+	}
+}
+
+func TestParseAssignsProviderWithBedrockDefault(t *testing.T) {
+	t.Parallel()
+
+	data := []byte(`{
+		"default": "opus-5",
+		"models": [
+			{"id": "global.anthropic.claude-opus-5", "aliases": ["opus-5"]},
+			{"id": "deepseek-v4-flash-ga-260731", "provider": "ark", "aliases": ["ds-flash"]}
+		]
+	}`)
+
+	catalog, err := Parse(data)
+	if err != nil {
+		t.Fatalf("解析配置失败: %v", err)
+	}
+
+	claude, ok := catalog.Resolve("opus-5")
+	if !ok {
+		t.Fatal("opus-5 应能解析")
+	}
+	if claude.ModelID != "global.anthropic.claude-opus-5" {
+		t.Fatalf("ModelID = %q", claude.ModelID)
+	}
+	if claude.Provider != llm.ProviderBedrock {
+		t.Fatalf("未指定 provider 时应缺省为 bedrock，实际 %q", claude.Provider)
+	}
+
+	deepseek, ok := catalog.Resolve("ds-flash")
+	if !ok {
+		t.Fatal("ds-flash 应能解析")
+	}
+	if deepseek.Provider != llm.ProviderArk {
+		t.Fatalf("Provider = %q，期望 ark", deepseek.Provider)
+	}
+	if deepseek.ModelID != "deepseek-v4-flash-ga-260731" {
+		t.Fatalf("ModelID = %q", deepseek.ModelID)
+	}
+}
+
+func TestParseRejectsUnknownProvider(t *testing.T) {
+	t.Parallel()
+
+	data := []byte(`{
+		"default": "m",
+		"models": [{"id": "m", "provider": "openai"}]
+	}`)
+
+	if _, err := Parse(data); err == nil {
+		t.Fatal("未知 provider 应报错")
 	}
 }

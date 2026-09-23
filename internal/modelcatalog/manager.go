@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"sync/atomic"
+
+	"github.com/zhshl/bedrock-anthropic-gateway/internal/llm"
 )
 
 // Manager 管理完整校验后的不可变目录快照。
@@ -34,6 +36,6 @@ func (m *Manager) Reload() error {
 	return nil
 }
 
-func (m *Manager) Resolve(name string) (string, bool) {
+func (m *Manager) Resolve(name string) (llm.Resolution, bool) {
 	return m.current.Load().Resolve(name)
 }
