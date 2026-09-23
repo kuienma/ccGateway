@@ -49,6 +49,9 @@ type EventEmitter struct {
 	// toolBlocks 把 OpenAI 的 tool_calls[].index 映射到 Anthropic 的 block index。
 	toolBlocks map[int]int
 
+	// sawToolUse 记录本条消息是否开过 tool_use 块，用于在 complete 里覆盖 stop_reason。
+	sawToolUse bool
+
 	inputTokens  int
 	outputTokens int
 }
@@ -179,8 +182,72 @@ func (e *EventEmitter) consumeText(content string) error {
 	})
 }
 
-// consumeToolCalls 在 Task 9 实现。
+// consumeToolCalls 处理工具调用分片。
+//
+// 首发分片带 ID 与 Function.Name，据此开一个新的 tool_use 块并登记
+// OpenAI tool index → Anthropic block index 的映射；
+// 后续分片只有 Function.Arguments，按映射追加 input_json_delta。
+//
+// 参数分片原样转发，绝不在中途解析 —— 分片会断在 JSON 转义符或多字节
+// UTF-8 字符中间，只有全部拼完才是合法 JSON。
+//
+// 续发分片直接查 toolBlocks 拿 block index 后发 delta，**不再经 openBlockOfKind**：
+// openBlockOfKind 对 tool_use 是「即使同类也关旧开新」，续发分片走它会重复关开块、
+// 产出非法的 start/stop 序列。
 func (e *EventEmitter) consumeToolCalls(calls []StreamToolCall) error {
+	for _, call := range calls {
+		if call.ID != "" || call.Function.Name != "" {
+			if err := e.openToolBlock(call); err != nil {
+				return err
+			}
+		}
+		if call.Function.Arguments == "" {
+			continue
+		}
+		index, ok := e.toolBlocks[call.Index]
+		if !ok {
+			return fmt.Errorf("收到 tool_calls[%d] 的参数分片但缺少首发分片", call.Index)
+		}
+		// 该工具的块必须仍处于打开状态，否则说明上游把多个工具的分片交错发送，
+		// 当前的流式实现无法处理（备选方案见实施计划 Task 9 说明）。
+		if e.openKind != blockKindToolUse || e.openIndex != index {
+			return fmt.Errorf("tool_calls[%d] 的参数分片在其内容块关闭后到达，上游分片存在交错", call.Index)
+		}
+		if err := e.write(map[string]any{
+			"type":  "content_block_delta",
+			"index": index,
+			"delta": map[string]any{
+				"type":         "input_json_delta",
+				"partial_json": call.Function.Arguments,
+			},
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// openToolBlock 为一个工具调用开启 tool_use 块，并登记 index 映射。
+//
+// 这里的 call.ID 是工具调用 id（形如 call_xxx），与消息 id 无关：
+// 它原样进 tool_use 块，不能套 newMessageID 的 msg_ 前缀。
+func (e *EventEmitter) openToolBlock(call StreamToolCall) error {
+	if call.ID == "" || call.Function.Name == "" {
+		return fmt.Errorf("tool_calls[%d] 首发分片缺少 id 或 name", call.Index)
+	}
+	if _, exists := e.toolBlocks[call.Index]; exists {
+		return fmt.Errorf("tool_calls[%d] 出现重复的首发分片", call.Index)
+	}
+	if err := e.openBlockOfKind(blockKindToolUse, map[string]any{
+		"type":  blockKindToolUse,
+		"id":    call.ID,
+		"name":  call.Function.Name,
+		"input": map[string]any{},
+	}); err != nil {
+		return err
+	}
+	e.toolBlocks[call.Index] = e.openIndex
+	e.sawToolUse = true
 	return nil
 }
 
@@ -226,6 +293,14 @@ func (e *EventEmitter) closeOpenBlock() error {
 func (e *EventEmitter) complete(stopReason string) error {
 	if err := e.closeOpenBlock(); err != nil {
 		return err
+	}
+	// 开过 tool_use 块就必须报 tool_use，不管上游 finish_reason 说什么。
+	// 直接透传会产出「end_turn + tool_use 块」的矛盾组合：Claude Code 见到 end_turn
+	// 就不执行工具，整个 agent 循环当场断掉，且表现为「模型不肯用工具」极难定位到网关。
+	// 实测 Ark 的 finish_reason 语义自洽（调工具给 tool_calls），今天不会触发这条，
+	// 但流式未必与非流式一致，状态机不该依赖上游永远自洽。
+	if e.sawToolUse {
+		stopReason = "tool_use"
 	}
 	// input_tokens 在 message_start 时还拿不到，这里一并给出真实值。
 	if err := e.write(map[string]any{
