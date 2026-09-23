@@ -102,9 +102,10 @@ func writeStreamChunk(w http.ResponseWriter, flusher http.Flusher, chunk []byte)
 
 func (s *Server) writeStreamError(w http.ResponseWriter, r *http.Request, flusher http.Flusher, err error) {
 	s.logger.Error("Bedrock 流式请求失败", "request_id", requestID(r.Context()), "error", err)
+	_, kind, message := classifyUpstreamError(err)
 	envelope := anthropic.ErrorEnvelope{
 		Type:      errorType,
-		Error:     anthropic.ErrorDetail{Type: anthropic.ErrorTypeAPI, Message: "Bedrock 流式请求失败"},
+		Error:     anthropic.ErrorDetail{Type: kind, Message: message},
 		RequestID: requestID(r.Context()),
 	}
 	encoded, marshalErr := json.Marshal(envelope)

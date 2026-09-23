@@ -5,14 +5,16 @@
       "id": "global.anthropic.claude-opus-5",
       "aliases": [
         "claude-opus-5",
-        "opus-5"
+        "opus-5",
+        "Qwen3.8-Max"
       ]
     },
     {
       "id": "global.anthropic.claude-opus-4-8",
       "aliases": [
         "claude-opus-4-8",
-        "opus-4-8"
+        "opus-4-8",
+        "Qwen3.8-Flash"
       ]
     }
   ]

@@ -56,7 +56,7 @@ func classifyUpstreamError(err error) (int, string, string) {
 	}
 
 	var apiError smithy.APIError
-	if errors.As(err, &apiError) && status < http.StatusInternalServerError {
+	if errors.As(err, &apiError) {
 		message = apiError.ErrorMessage()
 	}
 	return status, kind, message

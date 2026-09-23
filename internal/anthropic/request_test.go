@@ -2,6 +2,7 @@ package anthropic
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -72,51 +73,31 @@ func TestPrepareRequestUsesDefaultModel(t *testing.T) {
 	}
 }
 
-func TestPrepareRequestRemovesUnsupportedOutputFormat(t *testing.T) {
+func TestPrepareRequestPreservesOutputConfig(t *testing.T) {
 	t.Parallel()
-
-	raw := []byte(`{
-		"model":"opus-5",
-		"max_tokens":1,
-		"messages":[],
-		"output_config":{"format":{"type":"json_schema"},"effort":"high"}
-	}`)
-	prepared, err := PrepareRequest(raw, nil, resolverStub{"opus-5": "model-id"})
-	if err != nil {
-		t.Fatalf("准备请求失败: %v", err)
-	}
-
-	var body map[string]json.RawMessage
-	if err := json.Unmarshal(prepared.Body, &body); err != nil {
-		t.Fatalf("解析 Bedrock body 失败: %v", err)
-	}
-	var outputConfig map[string]json.RawMessage
-	if err := json.Unmarshal(body["output_config"], &outputConfig); err != nil {
-		t.Fatalf("解析 output_config 失败: %v", err)
-	}
-	if _, exists := outputConfig["format"]; exists {
-		t.Fatal("Bedrock body 不应包含 output_config.format")
-	}
-	assertJSONString(t, outputConfig["effort"], "high")
-}
-
-func TestPrepareRequestRemovesEmptyOutputConfig(t *testing.T) {
-	t.Parallel()
-
-	prepared, err := PrepareRequest(
-		[]byte(`{"model":"opus-5","messages":[],"output_config":{"format":{"type":"json_schema"}}}`),
-		nil,
-		resolverStub{"opus-5": "model-id"},
-	)
-	if err != nil {
-		t.Fatalf("准备请求失败: %v", err)
-	}
-	var body map[string]json.RawMessage
-	if err := json.Unmarshal(prepared.Body, &body); err != nil {
-		t.Fatalf("解析 Bedrock body 失败: %v", err)
-	}
-	if _, exists := body["output_config"]; exists {
-		t.Fatal("空 output_config 应被删除")
+	for _, tc := range []struct{ name, config string }{
+		{"schema", `{"format":{"type":"json_schema","schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}}}`},
+		{"schema_and_effort", `{"format":{"type":"json_schema","schema":{"type":"object","properties":{},"additionalProperties":false}},"effort":"high"}`},
+		{"empty", `{}`},
+		{"unknown_format", `{"format":{"type":"future_format","option":true}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prepared, err := PrepareRequest([]byte(`{"model":"opus-5","messages":[],"output_config":`+tc.config+`}`), nil, resolverStub{"opus-5": "model-id"})
+			if err != nil {
+				t.Fatalf("准备请求失败: %v", err)
+			}
+			var body map[string]any
+			if err := json.Unmarshal(prepared.Body, &body); err != nil {
+				t.Fatal(err)
+			}
+			var want any
+			if err := json.Unmarshal([]byte(tc.config), &want); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(body["output_config"], want) {
+				t.Fatalf("output_config 未原样透传: body=%s, want=%s", prepared.Body, tc.config)
+			}
+		})
 	}
 }
 

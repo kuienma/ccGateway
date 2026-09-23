@@ -2,6 +2,8 @@
 
 一个独立的 Anthropic Messages API 兼容网关，将 Claude 客户端请求转发到 AWS Bedrock。网关使用 AWS SDK 默认凭证链，不保存 AWS Access Key。
 
+开发前请阅读 [AI 编码与可维护性规范](docs/ai-coding-guidelines.md)，按模块职责、兼容性约束和变更类型选择实现与验证方式。
+
 ## 支持接口
 
 - `POST /v1/messages`：非流式与 SSE 流式 Messages API
@@ -16,6 +18,8 @@
 | `opus-4-8`、`claude-opus-4-8` | `global.anthropic.claude-opus-4-8` |
 
 目录中登记的完整 Bedrock model ID 也可以直接作为客户端模型名。未登记的模型会返回 `not_found_error`。
+
+`output_config`（包括 `format` 中的 JSON Schema）直接转发给 Bedrock，网关不按模型能力过滤或预先拒绝该字段。上游是否接受由实际模型判断；上游 API 错误保留错误消息，并转换为 Anthropic 错误结构。非流式响应保留上游 HTTP 错误状态；流式响应开始后通过 SSE `error` 事件返回错误类型与消息。
 
 ## 启动
 
