@@ -195,6 +195,58 @@ func TestStreamEmitsThinkingWhenRequested(t *testing.T) {
 	}
 }
 
+// arkReasoningStream 的 usage 带 completion_tokens_details.reasoning_tokens，数字取自真机
+// （task-5 那份非流式响应同款：prompt 89 / completion 11 / total 100 / reasoning 9）。
+//
+// 流式侧原本**没有任何 fixture 带这个字段**，所以「把 reasoning_tokens 加进 output_tokens」
+// 这个被明确否决的做法在流式路径上一个用例都抓不到（非流式有真机 fixture 兜住）。
+const arkReasoningStream = `data: {"choices":[{"delta":{"content":"","reasoning_content":"先想一下","role":"assistant"},"index":0}],"id":"s1","model":"m","object":"chat.completion.chunk","usage":null}
+
+data: {"choices":[{"delta":{"content":"好","role":"assistant"},"index":0}],"id":"s1","model":"m","object":"chat.completion.chunk","usage":null}
+
+data: {"choices":[{"delta":{"content":"","role":"assistant"},"finish_reason":"stop","index":0}],"id":"s1","model":"m","object":"chat.completion.chunk","usage":{"completion_tokens":11,"prompt_tokens":89,"total_tokens":100,"completion_tokens_details":{"reasoning_tokens":9}}}
+
+data: {"choices":[],"id":"s1","model":"m","object":"chat.completion.chunk","usage":{"completion_tokens":11,"prompt_tokens":89,"total_tokens":100,"completion_tokens_details":{"reasoning_tokens":9}}}
+
+data: [DONE]
+`
+
+// TestStreamExcludesReasoningTokensFromOutputTokens 钉住被明确否决的那条做法：
+// reasoning_tokens 绝不能计入 output_tokens。
+//
+// 依据是恒等式：实测 prompt(89) + completion(11) = total(100) 已经闭合，而
+// reasoning(9) < completion(11) —— 说明 reasoning_tokens 是 completion_tokens 的**内部
+// 拆分明细，不是加项**，推理 token 早已计入 completion_tokens。再叠加一次会让
+// input + output 超过 total，直接导致计费错误。
+//
+// 非流式那侧由 response_test.go 的真机 fixture 兜住，这条补上流式一侧。
+func TestStreamExcludesReasoningTokensFromOutputTokens(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t, streamingHandler(arkReasoningStream))
+	events := collectStream(t, client, `{"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`)
+
+	var usage map[string]any
+	for _, event := range events {
+		if event["type"] == "message_delta" {
+			usage = event["usage"].(map[string]any)
+		}
+	}
+	if usage == nil {
+		t.Fatal("未产出 message_delta，拿不到 usage")
+	}
+
+	// 期望值写字面量：11 是 completion_tokens，20 是错误地叠加 reasoning_tokens 的结果。
+	if got := usage["output_tokens"].(float64); got != 11 {
+		t.Fatalf("output_tokens = %v，必须等于 completion_tokens(11)；得到 20 说明把 "+
+			"reasoning_tokens(9) 也叠加进去了 —— 它是 completion_tokens 的内部拆分明细、"+
+			"不是加项，叠加会让 input+output 超过 total(100) 并导致计费错误", got)
+	}
+	if got := usage["input_tokens"].(float64); got != 89 {
+		t.Fatalf("input_tokens = %v，期望 89", got)
+	}
+}
+
 func TestStreamReportsTruncatedStream(t *testing.T) {
 	t.Parallel()
 

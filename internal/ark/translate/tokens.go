@@ -29,16 +29,22 @@ const perMessageOverhead = 4
 // 80 是按那次实测倒推的，只有一个数据点，精确值待真机复核（见 Task 11 报告）。
 const perRequestOverhead = 80
 
-// toolCharsPerToken 是工具定义文本的估算密度，刻意比 nonCJKCharsPerToken 更密。
+// perToolOverhead 是每个工具声明的固定成本。
 //
-// 依据是实测：一个工具让 prompt_tokens 涨了 308，而那份工具定义的文本量按
-// 3 字符/token 只值约 100 —— 模板把函数声明展开后还要加一层包装格式。只有一个数据点，
-// 所以这里不去凑那个倍率，只保证工具定义算得比普通文本贵（方向是高估）。
-// 精确倍率待真机复核（见 Task 11 报告的待验证清单）。
+// 真机实测（权威数据，见 docs/design §2 那次 curl）：同一请求体不带工具时
+// prompt_tokens = 89，加上一个 get_weather 工具定义后是 397 —— **一个工具的真实成本
+// 是 308 token**。而那份工具定义的文本一共只有 77 个字符，按任何「N 字符/token」
+// （N 为正整数）都最多只能算出 77 —— 也就是说工具成本**结构上不是按字符长度走的**，
+// 主体是模板为每个工具展开函数声明、渲染 JSON schema、附加使用说明的固定开销。
+// 所以这里用固定成本建模，而不是调密度系数：把密度调到能满足 308 需要 0.227 字符/token，
+// 整数系数根本表达不出来（详见 Task 11 报告 fix round 1 的 I1）。
 //
-// 刻意只留这一个旋钮：初版还加了一份 perToolOverhead，结果两个旋钮互相兜底 ——
-// 单独改坏任何一个，用例都照样全绿（变异验证抓到），等于两条都没护栏。
-const toolCharsPerToken = 2
+// 300 直接取自那个数据点（308 减去文本本身的量），方向上保证高估。单点数据，
+// 需多点校准 —— 校准时以 TestEstimateTokensMatchesRealToolCost 那条真机锚定断言为准。
+//
+// 刻意只留这一个旋钮：初版同时有密度系数与固定开销两个旋钮，结果互相兜底 ——
+// 单独改坏任何一个用例都照样全绿（变异验证抓到），等于两条都没护栏。
+const perToolOverhead = 300
 
 // maxContentDepth 限制 content 嵌套的递归深度。
 // 超过之后按原始 JSON 长度计入 —— 宁可多算，不可漏算。
@@ -61,10 +67,8 @@ func EstimateTokens(anthropicBody []byte) (int32, error) {
 		builder.WriteString(collectEstimateText(message.Content, 0))
 	}
 
-	// 工具定义要进上下文，且占比可观：实测同一输入带一个工具后 prompt_tokens 从 89
-	// 涨到 397（+308），所以 name / description / input_schema 全部计入，且按更密的
-	// toolCharsPerToken 计 —— 那份工具定义的文本量按 3 字符/token 只值约 100 token，
-	// 差额是模板把函数声明展开后的包装格式。
+	// 工具定义要进上下文，且占比可观（实测一个工具 +308 token）：name / description /
+	// input_schema 的文本全部计入，另加每个工具的固定声明开销，后者是主体。
 	var tools strings.Builder
 	for _, tool := range source.Tools {
 		tools.WriteString(tool.Name)
@@ -73,7 +77,8 @@ func EstimateTokens(anthropicBody []byte) (int32, error) {
 	}
 
 	total := perRequestOverhead + estimateTextTokens(builder.String()) +
-		perMessageOverhead*len(source.Messages) + estimateToolTokens(tools.String())
+		perMessageOverhead*len(source.Messages) +
+		perToolOverhead*len(source.Tools) + estimateTextTokens(tools.String())
 	// 理论上要 GB 级请求体才会溢出，但截断成负数比返回上限危险得多。
 	if total > math.MaxInt32 {
 		return math.MaxInt32, nil
@@ -106,13 +111,23 @@ func collectEstimateText(raw json.RawMessage, depth int) string {
 		return trimmed
 	}
 
-	var blocks []anthropicBlock
-	if err := json.Unmarshal(raw, &blocks); err != nil {
+	// 先拆成原始块再逐块解码：default 分支要拿得到**原始 JSON** 才能兑现
+	// 「按原始 JSON 长度计入」。只留 []anthropicBlock 的话，未知块在结构体里只剩
+	// 一个 Type 字段，image 的 base64 数据、document 的正文全部凭空消失 ——
+	// 客户端拿这类块调 count_tokens 会得到严重偏低的值。
+	var rawBlocks []json.RawMessage
+	if err := json.Unmarshal(raw, &rawBlocks); err != nil {
 		return trimmed
 	}
 
-	parts := make([]string, 0, len(blocks))
-	for _, block := range blocks {
+	parts := make([]string, 0, len(rawBlocks))
+	for _, rawBlock := range rawBlocks {
+		var block anthropicBlock
+		if err := json.Unmarshal(rawBlock, &block); err != nil {
+			// 单个块不可解码：按其原始 JSON 计入。
+			parts = append(parts, string(rawBlock))
+			continue
+		}
 		switch block.Type {
 		case "text":
 			parts = append(parts, block.Text)
@@ -125,9 +140,10 @@ func collectEstimateText(raw json.RawMessage, depth int) string {
 		case "tool_result":
 			parts = append(parts, collectEstimateText(block.Content, depth+1))
 		default:
-			// image 等块在 BuildRequest 阶段会被拒绝，真实请求走不到计费；
-			// 估算阶段仍按块类型名粗计，保证不返回 0。
-			parts = append(parts, block.Type)
+			// image / document / 未来新增的块类型：按原始 JSON 长度计入（base64 数据
+			// 也算在内）。这类块在 BuildRequest 阶段会被拒绝，真实请求走不到计费，
+			// 但 count_tokens 是独立端点，客户端完全可以只问不发 —— 宁可多算。
+			parts = append(parts, string(rawBlock))
 		}
 	}
 	return strings.Join(parts, " ")
@@ -136,15 +152,6 @@ func collectEstimateText(raw json.RawMessage, depth int) string {
 // estimateTextTokens 按字符类别估算 token 数：
 // CJK 约 1 token/字（实测 0.6~1，取上界），其余按 nonCJKCharsPerToken 字符/token。
 func estimateTextTokens(text string) int {
-	return estimateWithDensity(text, nonCJKCharsPerToken)
-}
-
-// estimateToolTokens 估算工具定义文本，非 CJK 部分按更密的 toolCharsPerToken 计。
-func estimateToolTokens(text string) int {
-	return estimateWithDensity(text, toolCharsPerToken)
-}
-
-func estimateWithDensity(text string, charsPerToken int) int {
 	var cjk, other int
 	for _, r := range text {
 		if unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) ||
@@ -155,7 +162,7 @@ func estimateWithDensity(text string, charsPerToken int) int {
 		other++
 	}
 	// other 向上取整，避免短输入被估成 0。
-	return cjk + (other+charsPerToken-1)/charsPerToken
+	return cjk + (other+nonCJKCharsPerToken-1)/nonCJKCharsPerToken
 }
 
 // WantsThinking 报告客户端是否显式请求了 thinking。

@@ -2,6 +2,7 @@ package translate
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -199,12 +200,74 @@ func TestEstimateTokensIncludesToolDefinitions(t *testing.T) {
 	}
 }
 
+// realToolCost 是真机实测的单个工具定义成本（权威数据，见 docs/design §2）：
+// 同一请求体不带工具时 prompt_tokens = 89，加上下面那个 get_weather 工具后是 397。
+const realToolCost = 397 - 89
+
+// realToolDefinition 是那次实测所用的工具定义（brief 里的 get_weather）。
+const realToolDefinition = `{"name":"get_weather","description":"查询指定城市的天气",` +
+	`"input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}`
+
+// TestEstimateTokensMatchesRealToolCost 把真机观测直接变成断言：一个工具定义的估算
+// **增量**必须 >= 实测的 308 token。
+//
+// 这是整个工具那一路唯一真正的护栏，也是本任务最贵的一条教训。之前的版本只断言
+// 「工具定义比普通文本贵」，那是个**方向对、量级错**的护栏：实测增量只有 43，是真实值的
+// 1/7.2；换成 Claude Code 常态的十几个工具，估算只有真实值的约 39% —— 正落在
+// 「必须偏向高估」要避免的那一侧，而当时全部用例都是绿的。
+//
+// 用增量而不是绝对值，理由同 marginalTokens：绝对值里含 perRequestOverhead，
+// 会把断言变成空的。
+func TestEstimateTokensMatchesRealToolCost(t *testing.T) {
+	t.Parallel()
+
+	const messages = `"messages":[{"role":"user","content":"hi"}]`
+	bare, err := EstimateTokens([]byte(`{"max_tokens":8,` + messages + `}`))
+	if err != nil {
+		t.Fatalf("估算失败: %v", err)
+	}
+	tooled, err := EstimateTokens([]byte(`{"max_tokens":8,` + messages +
+		`,"tools":[` + realToolDefinition + `]}`))
+	if err != nil {
+		t.Fatalf("估算失败: %v", err)
+	}
+
+	if got := int(tooled - bare); got < realToolCost {
+		t.Fatalf("单个工具定义的估算增量 %d 低于真机实测的 %d token："+
+			"工具成本结构上不是按字符长度走的（那份定义只有 77 个字符），"+
+			"主体是模板为每个工具展开声明的固定开销，必须按固定成本建模并保证高估",
+			got, realToolCost)
+	}
+}
+
+// TestEstimateTokensScalesToolCostWithCount 配对上面那条：单工具达标也可能是把成本写死成
+// 一份常量（不随工具数量增长），那样十几个工具的常态形态照样严重低估，而上面那条全绿。
+func TestEstimateTokensScalesToolCostWithCount(t *testing.T) {
+	t.Parallel()
+
+	const messages = `"messages":[{"role":"user","content":"hi"}]`
+	one, err := EstimateTokens([]byte(`{"max_tokens":8,` + messages +
+		`,"tools":[` + realToolDefinition + `]}`))
+	if err != nil {
+		t.Fatalf("估算失败: %v", err)
+	}
+	three, err := EstimateTokens([]byte(`{"max_tokens":8,` + messages +
+		`,"tools":[` + realToolDefinition + `,` + realToolDefinition + `,` + realToolDefinition + `]}`))
+	if err != nil {
+		t.Fatalf("估算失败: %v", err)
+	}
+
+	// 三个同样的工具应当花掉约三倍；下界给到 2.5 倍，留出固定项的余量。
+	if int(three) < int(one)*5/2 {
+		t.Fatalf("三个工具的估算 %d 不到单个工具 %d 的 2.5 倍：工具成本必须随数量增长，"+
+			"否则带十几个工具的常态请求会严重低估", three, one)
+	}
+}
+
 // TestEstimateTokensChargesToolDefinitionsDenser 钉住工具定义比同样长度的普通文本更贵。
 //
-// 实测一个工具让 prompt_tokens 从 89 涨到 397（+308），而那份工具定义的文本量按
-// 3 字符/token 只值约 100 token —— 说明模板把工具声明展开后还要加一层包装格式，
-// 按普通文本的密度估工具定义会系统性低估近 3 倍。这里不去焊死倍率（只有一个数据点），
-// 只锁住「工具定义必须按更密的系数计」这个方向。
+// 与上面那条真机锚定断言的分工：这条锁「方向」（工具定义不能按普通散文算），
+// 上面那条锁「量级」。两条都留着 —— 量级那条是新加的，方向这条在系数被调小时更早失败。
 func TestEstimateTokensChargesToolDefinitionsDenser(t *testing.T) {
 	t.Parallel()
 
@@ -264,9 +327,12 @@ func TestEstimateTokensCountsToolUseAndToolResultBlocks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("估算失败: %v", err)
 	}
-	// 只比大小会被 perMessageOverhead 蒙混：多两条消息本身就带 8 token 固定开销，
+	// 只比大小会被每条消息的固定开销蒙混：多两条消息本身就带 8 token 开销，
 	// 即使正文全被丢掉也能通过。所以要把开销扣掉再比。
-	overheadOnly := bareCount + 2*perMessageOverhead
+	//
+	// 这里的 8 刻意写字面量而不是 2*perMessageOverhead：用实现自己的常量算期望值
+	// 是同义反复 —— 那个常量取任何值断言都成立，等于它完全没有护栏。
+	overheadOnly := bareCount + 8
 	if toolCount <= overheadOnly {
 		t.Fatalf("tool_use / tool_result 的正文未计入：估算 %d 未超过纯消息开销 %d",
 			toolCount, overheadOnly)
@@ -274,6 +340,39 @@ func TestEstimateTokensCountsToolUseAndToolResultBlocks(t *testing.T) {
 	// tool_result 里有 26 个汉字，单这一项就该贡献 20+ token。
 	if toolCount < overheadOnly+20 {
 		t.Fatalf("tool_result 正文的贡献明显偏低: %d vs 下界 %d", toolCount, overheadOnly+20)
+	}
+}
+
+// TestEstimateTokensCountsUnknownBlocksByRawJSON 钉住 collectEstimateText 的 default 分支
+// 兑现它的文档承诺：「按原始 JSON 长度计入」。
+//
+// 之前那版注释这么写，代码却只 append 了 block.Type（几个字符），把分支改成零贡献时全绿。
+// 后果：客户端拿 image / document / 未来新增的块类型调 count_tokens 会得到严重偏低的值 ——
+// image 的 base64 数据往往是整个请求里最大的一块。count_tokens 是独立端点，客户端完全
+// 可以只问不发，所以「这类块反正会被 BuildRequest 拒绝」不是理由。
+func TestEstimateTokensCountsUnknownBlocksByRawJSON(t *testing.T) {
+	t.Parallel()
+
+	// 用一个体量可观的未知块：只按 type 粗计的实现会把它当成十几个字符。
+	payload := strings.Repeat("QUJDREVGR0hJSktMTU5PUFFSU1RVVld", 40) // 约 1.2KB 的 base64 形态
+	body := []byte(`{"max_tokens":8,"messages":[{"role":"user","content":[` +
+		`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + payload + `"}}]}]}`)
+	bare := []byte(`{"max_tokens":8,"messages":[{"role":"user","content":[]}]}`)
+
+	bareCount, err := EstimateTokens(bare)
+	if err != nil {
+		t.Fatalf("估算失败: %v", err)
+	}
+	withImage, err := EstimateTokens(body)
+	if err != nil {
+		t.Fatalf("估算失败: %v", err)
+	}
+
+	floor := len(payload) / 3
+	if got := int(withImage - bareCount); got < floor {
+		t.Fatalf("未知块的估算增量 %d 低于其原始 JSON 的文本量下界 %d —— "+
+			"default 分支必须按原始 JSON 计入，只算块类型名会让 image 的 base64 数据凭空消失",
+			got, floor)
 	}
 }
 
@@ -308,6 +407,49 @@ func TestWantsThinking(t *testing.T) {
 	}
 }
 
+// TestBuildRequestThinkingMatchesWantsThinking 把请求侧与响应侧的 thinking 判断钉在一起。
+//
+// 两侧原本是两份独立实现（request.go 内联比较 Type == "enabled"，tokens.go 里的
+// WantsThinking 又写一遍），没有编译期耦合也没有配对断言 —— 让它们分叉后九个包全绿。
+// 后果是静默花钱：请求侧下发 thinking: enabled、Ark 照旧产出 reasoning_content 并计费，
+// 响应侧却把 thinking 块丢掉，用户为被扔掉的 reasoning 付费，且现象上完全看不出来。
+// 这是本项目第五次跨路径不一致，所以这条断言必须存在。
+func TestBuildRequestThinkingMatchesWantsThinking(t *testing.T) {
+	t.Parallel()
+
+	bodies := []string{
+		`{"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`,
+		`{"max_tokens":8,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":1024}}`,
+		`{"max_tokens":8,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}`,
+		`{"max_tokens":8,"messages":[{"role":"user","content":"hi"}],"thinking":null}`,
+	}
+	for _, body := range bodies {
+		t.Run(body, func(t *testing.T) {
+			t.Parallel()
+
+			req, rejection := BuildRequest("m", []byte(body), false)
+			if rejection != nil {
+				t.Fatalf("BuildRequest 失败: %v", rejection)
+			}
+			if req.Thinking == nil {
+				t.Fatal("thinking 必须始终显式下发：Ark 不传时默认开启思考")
+			}
+
+			// 请求侧下发 enabled ⟺ 响应侧会透出 thinking 块。两者必须严格同真同假。
+			wantEnabled := WantsThinking([]byte(body))
+			gotEnabled := req.Thinking.Type == "enabled"
+			if gotEnabled != wantEnabled {
+				t.Fatalf("请求侧下发 thinking.type=%q（enabled=%v），而响应侧 WantsThinking=%v —— "+
+					"两侧判断分叉会让用户为被丢弃的 reasoning 付费",
+					req.Thinking.Type, gotEnabled, wantEnabled)
+			}
+			if !gotEnabled && req.Thinking.Type != "disabled" {
+				t.Fatalf("未请求 thinking 时必须显式下发 disabled，实际 %q", req.Thinking.Type)
+			}
+		})
+	}
+}
+
 func TestBuildRequestClampsMaxTokens(t *testing.T) {
 	t.Parallel()
 
@@ -316,8 +458,14 @@ func TestBuildRequestClampsMaxTokens(t *testing.T) {
 	if rejection != nil {
 		t.Fatalf("超限的 max_tokens 应钳制而非报错: %v", rejection)
 	}
-	if req.MaxTokens != MaxOutputTokens {
-		t.Fatalf("MaxTokens = %d，期望钳制到 %d", req.MaxTokens, MaxOutputTokens)
+	// 期望值写字面量 32768 而不是 MaxOutputTokens：拿实现自己的常量当期望值是同义反复，
+	// 把 MaxOutputTokens 改成 999999999 时钳制实际上不再发生，而断言照样成立。
+	// 32768 是该模型的输出上限这一事实，本身就该被钉在用例里。
+	if req.MaxTokens != 32768 {
+		t.Fatalf("MaxTokens = %d，期望钳制到 32768", req.MaxTokens)
+	}
+	if MaxOutputTokens != 32768 {
+		t.Fatalf("MaxOutputTokens = %d，该模型的输出上限是 32768", MaxOutputTokens)
 	}
 }
 
