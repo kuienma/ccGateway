@@ -158,7 +158,15 @@ func TestStreamReportsTruncatedStream(t *testing.T) {
 	}
 }
 
-func TestStreamMapsUpstreamErrorBeforeStreaming(t *testing.T) {
+// TestStreamMapsUpstreamErrorToStatusError 钉住上游非 2xx 被映射成 llm.StatusError
+// 且状态码、上游描述都如实带出。
+//
+// ClientMessage 那条断言不是锦上添花，它是这条用例真正的承重部分：上游描述是把状态码
+// 检查挪到 scanSSE 之后时**唯一会退化**的东西。挪走之后 scanSSE 已把 body 读到 EOF，
+// errorFromResponse 的 LimitReader 只能拿到 0 字节，message 回落成默认文案 ——
+// 错误从「ark 请求失败 (429): 限流」变成「ark 请求失败 (429): Ark 请求失败」，
+// 而 Status() 仍是 429。少了这条断言，顺序缺陷在本用例里完全不可见。
+func TestStreamMapsUpstreamErrorToStatusError(t *testing.T) {
 	t.Parallel()
 
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -179,19 +187,22 @@ func TestStreamMapsUpstreamErrorBeforeStreaming(t *testing.T) {
 	if statusErr.Status() != http.StatusTooManyRequests {
 		t.Fatalf("Status = %d", statusErr.Status())
 	}
+	if !strings.Contains(err.Error(), "限流") {
+		t.Fatalf("错误信息应带出上游描述「限流」，实际 %v —— "+
+			"响应体被读空后 message 会回落成默认文案，说明状态码检查发生在开流之后", err)
+	}
 }
 
 // TestStreamEmitsNothingWhenUpstreamStatusIsNot2xx 钉住「非 2xx 必须在**开流之前**映射
-// 成错误」这个顺序本身。
+// 成错误」这个顺序本身，断言的是客户端侧的直接后果：一个事件都没产出。
 //
-// 上面那条用例名字里写着 BeforeStreaming，实际却锁不住顺序：把状态码检查挪到 scanSSE
-// 之后它依然全绿 —— 那个 429 的响应体不是 SSE 形态，scanSSE 一个 chunk 都解析不出、
-// 也不报错，随后 errorFromResponse 仍能凭 response.StatusCode 造出同样的 429。
-// （已实测确认该变异存活。）
+// 与上面那条的分工：上面那条从**错误内容退化**的角度抓这条顺序（响应体被 scanSSE 读空
+// 后上游描述会丢），这条从**已产出事件**的角度抓。两条都能独立抓住「状态码检查挪到
+// scanSSE 之后」这个变异，各自覆盖一种上游形态（JSON 错误体 / SSE 形态错误体）。
 //
-// 真正会出事的是上游以 SSE 形态下发错误：先开流再检查状态码，客户端会先收到 message_start
+// 上游以 SSE 形态下发错误时危害最直观：先开流再检查状态码，客户端会先收到 message_start
 // 之类的半条消息、再收到 error 事件，既无法按可重试处理，也会让已经开始渲染的回答烂尾。
-// 所以这里断言的是「一个事件都没产出」。
+// 实测该变异下这里会产出 6 个事件。
 func TestStreamEmitsNothingWhenUpstreamStatusIsNot2xx(t *testing.T) {
 	t.Parallel()
 
@@ -261,10 +272,14 @@ func TestStreamPropagatesEmitError(t *testing.T) {
 // 总时长远小于 Timeout，加不加 WithTimeout 都全绿。要等真实场景里模型输出时间超过
 // ARK_TIMEOUT 才暴露，症状是"模型偶尔不说完话"，极难定位到网关。所以这里刻意让流的
 // 总时长数倍于 Timeout，而响应头立即下发（绕过 Transport.ResponseHeaderTimeout）。
+//
+// timeout 取 200ms 而非更小值：它同时充当 Transport.ResponseHeaderTimeout，虽然 handler
+// 立即 WriteHeader + Flush、机制上不受影响，但留足预算可避免极端负载下的抖动误报。
+// 护栏强度不受影响 —— 流的总时长按同一常数放大，始终是 Timeout 的 4 倍。
 func TestStreamDoesNotImposeTotalTimeoutOnSlowStream(t *testing.T) {
 	t.Parallel()
 
-	const timeout = 80 * time.Millisecond
+	const timeout = 200 * time.Millisecond
 	head, tail, found := strings.Cut(arkToolStream, "data: "+doneMarker)
 	if !found {
 		t.Fatalf("arkToolStream 应含 %s 标记", doneMarker)
