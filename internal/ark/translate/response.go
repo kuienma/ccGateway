@@ -139,6 +139,16 @@ func BuildResponse(payload []byte, includeThinking bool) ([]byte, error) {
 			Input: input,
 		})
 	}
+	// 产出里只要有 tool_use 块，stop_reason 就必须是 tool_use，不管上游 finish_reason 说什么。
+	// 直接透传会产出「end_turn + tool_use 块」的矛盾组合：客户端见到 end_turn 就不执行工具，
+	// agent 循环当场断掉，且表现为「模型不肯用工具」极难定位到网关。
+	// 与流式 EventEmitter.complete 里那条 sawToolUse 覆盖是同一条语义，两条路径必须一致。
+	for _, block := range result.Content {
+		if block.Type == "tool_use" {
+			result.StopReason = "tool_use"
+			break
+		}
+	}
 	// content 为空数组时保持 [] 而不是 null，Claude Code 按数组解析。
 	if result.Content == nil {
 		result.Content = []responseBlock{}

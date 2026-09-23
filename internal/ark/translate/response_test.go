@@ -263,3 +263,49 @@ func TestBuildResponseKeepsEmptyContentAsArray(t *testing.T) {
 		t.Fatalf("content 应是空数组，实际 %#v", content)
 	}
 }
+
+// TestBuildResponseStopReasonOverriddenWhenToolUseBlockPresent 锁住非流式的 stop_reason 覆盖。
+//
+// 上游若自相矛盾地给出 finish_reason=stop + 非空 tool_calls，直接透传 MapStopReason
+// 会产出「end_turn + tool_use 块」：客户端见到 end_turn 就不执行工具，agent 循环当场
+// 断掉，且表现为「模型不肯用工具」极难定位到网关。
+// 与流式 EventEmitter 的 sawToolUse 覆盖是同一条语义，两条路径必须给出一致的结果。
+//
+// 实测 Ark 的 finish_reason 语义自洽（今天不会触发），但两条路径都不该依赖上游永远自洽。
+func TestBuildResponseStopReasonOverriddenWhenToolUseBlockPresent(t *testing.T) {
+	t.Parallel()
+
+	// finish_reason 刻意是 stop，而 tool_calls 非空。
+	payload := `{
+		"id": "resp-1",
+		"model": "m",
+		"choices": [{
+			"finish_reason": "stop",
+			"index": 0,
+			"message": {"content": "", "role": "assistant", "tool_calls": [
+				{"id": "call_1", "type": "function", "index": 0,
+				 "function": {"name": "get_weather", "arguments": "{\"city\": \"北京\"}"}}
+			]}
+		}],
+		"usage": {"completion_tokens": 20, "prompt_tokens": 100}
+	}`
+
+	out, err := BuildResponse([]byte(payload), false)
+	if err != nil {
+		t.Fatalf("转换失败: %v", err)
+	}
+	decoded := decodeAnthropicResponse(t, out)
+
+	if decoded["stop_reason"] != "tool_use" {
+		t.Fatalf("响应含 tool_use 块时 stop_reason 必须被覆盖为 tool_use，实际 %v", decoded["stop_reason"])
+	}
+	// 覆盖 stop_reason 不能动 content：tool_use 块本身要原样保留。
+	content, ok := decoded["content"].([]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("content 应只含一个 tool_use 块，实际 %#v", decoded["content"])
+	}
+	block := content[0].(map[string]any)
+	if block["type"] != "tool_use" || block["id"] != "call_1" || block["name"] != "get_weather" {
+		t.Fatalf("tool_use 块 = %#v", block)
+	}
+}
