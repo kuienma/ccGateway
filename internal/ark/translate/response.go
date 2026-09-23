@@ -119,8 +119,17 @@ func BuildResponse(payload []byte, includeThinking bool) ([]byte, error) {
 		if len(input) == 0 {
 			input = json.RawMessage("{}")
 		}
-		if !json.Valid(input) {
-			return nil, fmt.Errorf("tool_calls[%d].function.arguments 不是合法 JSON", index)
+		// Anthropic 的 tool_use.input 必须是对象，所以这里不能只用 json.Valid：
+		// 123 / "abc" / [1,2] / true / null 都是合法 JSON，放过去会让客户端拿到
+		// 非对象的 input。其中 null 最糟——omitempty 对 4 字节的 RawMessage 不生效，
+		// 字段照样吐出，客户端走的是空指针路径而不是类型错误。
+		var probe map[string]json.RawMessage
+		if err := json.Unmarshal(input, &probe); err != nil {
+			return nil, fmt.Errorf("tool_calls[%d].function.arguments 必须是 JSON 对象: %w", index, err)
+		}
+		// JSON null 解进 map 是合法的 no-op（不报错，probe 为 nil），必须单独拦。
+		if probe == nil {
+			return nil, fmt.Errorf("tool_calls[%d].function.arguments 必须是 JSON 对象，实际为 null", index)
 		}
 		result.Content = append(result.Content, responseBlock{
 			Type:  "tool_use",

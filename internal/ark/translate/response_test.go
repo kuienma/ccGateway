@@ -2,6 +2,7 @@ package translate
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -182,5 +183,82 @@ func TestBuildResponseKeepsMalformedToolArgumentsVisible(t *testing.T) {
 
 	if _, err := BuildResponse([]byte(payload), false); err == nil {
 		t.Fatal("工具参数不是合法 JSON 时必须报错，不能静默产出损坏的 input")
+	}
+}
+
+// toolArgumentsResponse 造一个只有一个 tool_call 的响应，arguments 原样嵌入。
+// arguments 在 Ark 侧是 JSON 字符串，所以这里要二次转义。
+func toolArgumentsResponse(t *testing.T, arguments string) []byte {
+	t.Helper()
+	encoded, err := json.Marshal(arguments)
+	if err != nil {
+		t.Fatalf("构造用例失败: %v", err)
+	}
+	return []byte(`{"id":"r","model":"m","choices":[{"finish_reason":"tool_calls",` +
+		`"message":{"role":"assistant","content":"","tool_calls":[` +
+		`{"id":"c1","type":"function","function":{"name":"f","arguments":` + string(encoded) + `}}]}}],` +
+		`"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+}
+
+// Anthropic 的 tool_use.input 必须是对象。合法但非对象的 JSON（尤其 null）
+// 会让客户端走空指针路径而不是报类型错误，必须在网关这一层拦掉。
+func TestBuildResponseRejectsNonObjectToolArguments(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		arguments string
+	}{
+		{"null", "null"},
+		{"数字标量", "123"},
+		{"字符串标量", `"abc"`},
+		{"数组", "[1,2]"},
+		{"布尔", "true"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			out, err := BuildResponse(toolArgumentsResponse(t, tc.arguments), false)
+			if err == nil {
+				t.Fatalf("arguments=%s 是合法 JSON 但不是对象，必须报错，实际产出 %s", tc.arguments, out)
+			}
+		})
+	}
+}
+
+func TestBuildResponseAcceptsObjectToolArguments(t *testing.T) {
+	t.Parallel()
+
+	for _, arguments := range []string{`{}`, `{"city": "北京"}`} {
+		out, err := BuildResponse(toolArgumentsResponse(t, arguments), false)
+		if err != nil {
+			t.Fatalf("arguments=%s 是合法对象，不应报错: %v", arguments, err)
+		}
+		content := decodeAnthropicResponse(t, out)["content"].([]any)
+		block := content[0].(map[string]any)
+		if _, ok := block["input"].(map[string]any); !ok {
+			t.Fatalf("arguments=%s 的 input 应是对象，实际 %#v", arguments, block["input"])
+		}
+	}
+}
+
+// content 最终为空时必须保持 []，客户端按数组解析，null 会直接崩。
+func TestBuildResponseKeepsEmptyContentAsArray(t *testing.T) {
+	t.Parallel()
+
+	payload := `{"id":"r","model":"m","choices":[{"finish_reason":"stop",
+		"message":{"role":"assistant","content":""}}],
+		"usage":{"prompt_tokens":1,"completion_tokens":1}}`
+
+	out, err := BuildResponse([]byte(payload), false)
+	if err != nil {
+		t.Fatalf("转换失败: %v", err)
+	}
+	if !strings.Contains(string(out), `"content":[]`) {
+		t.Fatalf("content 为空时必须序列化成 []，实际 %s", out)
+	}
+	content, ok := decodeAnthropicResponse(t, out)["content"].([]any)
+	if !ok || len(content) != 0 {
+		t.Fatalf("content 应是空数组，实际 %#v", content)
 	}
 }
