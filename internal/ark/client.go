@@ -196,11 +196,36 @@ func kindForStatus(status int) string {
 	}
 }
 
-// Stream 在 Task 10 实现。
-// 实现时不要套用 Invoke 的 c.timeout：流式生命周期只由传入的 context 控制，
-// 加总时长上限会把长回复硬截断。
+// Stream 发起流式调用，把上游 SSE 重组成 Anthropic 事件序列交给 emit。
+//
+// 刻意不套用 Invoke 的 c.timeout：流式生命周期只由传入的 context 与 Transport 的
+// ResponseHeaderTimeout 控制，加总时长上限会把长回复硬截断。
+//
+// post 的契约是调用方关 Body，下面的 defer 覆盖了全部早退分支：非 2xx、scanSSE 出错、
+// emit 回调出错（由 scanSSE 透传）、Finish 出错。
 func (c *Client) Stream(ctx context.Context, modelID string, body []byte, emit func([]byte) error) error {
-	return fmt.Errorf("ark 流式调用尚未实现")
+	response, err := c.post(ctx, modelID, body, true)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+
+	// 非 2xx 必须在开流之前就映射成错误：已经开始产出事件后再报错，客户端会先收到
+	// 半条消息再收到 error 事件，无法按可重试处理。
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return c.errorFromResponse(response)
+	}
+
+	// includeThinking 在 Task 11 接上客户端的 thinking 开关，当前一律不透出。
+	emitter := translate.NewEventEmitter(modelID, false, emit)
+	sawDone, err := scanSSE(response.Body, emitter.Consume)
+	// scanSSE 的错误绝不能吞掉：状态机在写 message_stop **之前**就把 finished 置真了，
+	// 那次 write 失败时 emitter 已进吸收态、Finish 只会返回 nil，此时唯一还能反映失败的
+	// 就是这个返回值。
+	if err != nil {
+		return err
+	}
+	return emitter.Finish(sawDone)
 }
 
 // CountTokens 在 Task 11 实现。
