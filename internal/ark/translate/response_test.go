@@ -45,8 +45,9 @@ func TestBuildResponseMapsTextAndUsage(t *testing.T) {
 	if decoded["role"] != "assistant" {
 		t.Fatalf("role = %v", decoded["role"])
 	}
-	if decoded["id"] != "021790133452915006c460d0b2d36d003716bcb3522c0d185f955" {
-		t.Fatalf("id 应沿用上游，实际 %v", decoded["id"])
+	// id 在上游值前加 msg_ 前缀（Anthropic 真实 API 的形态），与流式路径共用同一构造。
+	if decoded["id"] != "msg_021790133452915006c460d0b2d36d003716bcb3522c0d185f955" {
+		t.Fatalf("id 应为 msg_ + 上游 id，实际 %v", decoded["id"])
 	}
 	if decoded["model"] != "deepseek-v4-flash-ga-260731" {
 		t.Fatalf("model = %v", decoded["model"])

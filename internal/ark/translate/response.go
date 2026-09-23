@@ -87,7 +87,8 @@ func BuildResponse(payload []byte, includeThinking bool) ([]byte, error) {
 	choice := source.Choices[0]
 
 	result := anthropicResponse{
-		ID:         source.ID,
+		// 与流式路径共用 newMessageID，确保两条路径给客户端的 id 形态一致。
+		ID:         newMessageID(source.ID),
 		Type:       "message",
 		Role:       "assistant",
 		Model:      source.Model,

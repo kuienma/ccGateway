@@ -12,6 +12,18 @@ const (
 	blockKindToolUse  = "tool_use"
 )
 
+// newMessageID 把上游 id 转成 Anthropic 形态的 message id。
+//
+// 流式与非流式**必须共用**它：两条路径各自拼前缀，就是 review 抓到的
+// 「同一会话在两条路径上 id 形态打架」的成因。Anthropic 真实 API 的 message id
+// 带 msg_ 前缀，上游没给 id 时回落到固定兜底值。
+func newMessageID(upstreamID string) string {
+	if upstreamID == "" {
+		return "msg_ark"
+	}
+	return "msg_" + upstreamID
+}
+
 // EventEmitter 把 Ark 的扁平 delta 流重组成 Anthropic 的事件序列。
 //
 // 不变式：
@@ -112,10 +124,7 @@ func (e *EventEmitter) ensureStarted(chunk StreamChunk) error {
 		return nil
 	}
 	e.started = true
-	e.messageID = "msg_ark"
-	if chunk.ID != "" {
-		e.messageID = "msg_" + chunk.ID
-	}
+	e.messageID = newMessageID(chunk.ID)
 	// model 以上游回显值为准，与非流式 BuildResponse 用 source.Model 保持同一取值来源：
 	// 万一 Ark 做模型路由或降级（比如 GA 快照下线自动切版本），两条路径都会如实报告实际
 	// 模型，而不是我们请求的那个。实测流式 chunk 的 model 原样回显请求的 modelID，

@@ -258,11 +258,10 @@ func TestEventEmitterDropsReasoningWhenDisabled(t *testing.T) {
 		t.Fatalf("Finish 失败: %v", err)
 	}
 
+	// assertTypes 只比对 type 序列、不看 content_block.type，所以这条独立断言有价值。
 	for _, event := range log.events {
-		if encoded, _ := json.Marshal(event); string(encoded) != "" {
-			if block, ok := event["content_block"].(map[string]any); ok && block["type"] == "thinking" {
-				t.Fatal("includeThinking=false 时不应产出 thinking 块")
-			}
+		if block, ok := event["content_block"].(map[string]any); ok && block["type"] == "thinking" {
+			t.Fatal("includeThinking=false 时不应产出 thinking 块")
 		}
 	}
 	assertTypes(t, log.types(), []string{
@@ -280,10 +279,12 @@ func TestEventEmitterIgnoresUsageOnlyChunk(t *testing.T) {
 	if err := emitter.Consume(textChunk("hi")); err != nil {
 		t.Fatalf("Consume 失败: %v", err)
 	}
-	if err := emitter.Consume(finishChunk("stop", 7, 4)); err != nil {
-		t.Fatalf("Consume 失败: %v", err)
-	}
-	// 末尾纯 usage chunk：choices 为空，不应产出任何事件。
+	// 纯 usage chunk（choices 为空数组）：先吃掉 usage，再按长度守卫提前返回，
+	// 既不能 panic（不可直取 Choices[0]），也不能产出任何事件。
+	//
+	// 它刻意排在 finish **之前** —— 排在 finish 之后会被 finished 早退直接挡掉，
+	// len(Choices)==0 这条守卫就永远走不到，用例会自我失效（而那条早退分支
+	// 已由 ConsumeAfterFinishIsIgnored 覆盖）。
 	before := len(log.events)
 	if err := emitter.Consume(StreamChunk{ID: "s1", Model: "m", Usage: &Usage{PromptTokens: 7, CompletionTokens: 4}}); err != nil {
 		t.Fatalf("Consume 失败: %v", err)
@@ -291,8 +292,102 @@ func TestEventEmitterIgnoresUsageOnlyChunk(t *testing.T) {
 	if len(log.events) != before {
 		t.Fatalf("纯 usage chunk 不应产出事件，新增了 %d 个", len(log.events)-before)
 	}
+	// finish chunk 带同一份 usage —— 实测上游就是这样把 usage 重复给两次。
+	// 记录 usage 必须是赋值：写成累加这里会得到 14/8。
+	if err := emitter.Consume(finishChunk("stop", 7, 4)); err != nil {
+		t.Fatalf("Consume 失败: %v", err)
+	}
 	if err := emitter.Finish(true); err != nil {
 		t.Fatalf("Finish 失败: %v", err)
+	}
+
+	deltas := log.ofType(t, "message_delta")
+	if len(deltas) != 1 {
+		t.Fatalf("message_delta 数 = %d", len(deltas))
+	}
+	usage := deltas[0]["usage"].(map[string]any)
+	if usage["input_tokens"].(float64) != 7 {
+		t.Fatalf("usage 重复出现必须覆盖而非累加，input_tokens = %v，期望 7", usage["input_tokens"])
+	}
+	if usage["output_tokens"].(float64) != 4 {
+		t.Fatalf("usage 重复出现必须覆盖而非累加，output_tokens = %v，期望 4", usage["output_tokens"])
+	}
+}
+
+func TestEventEmitterKeepsUsageFromChoicelessChunk(t *testing.T) {
+	t.Parallel()
+
+	log := &eventLog{}
+	emitter := NewEventEmitter("m", false, log.emit)
+
+	// 本用例里唯一的 usage 来源就是这个 choices 为空的 chunk：它必须在长度守卫提前返回
+	// **之前**就被记下。若把 usage 的读取挪到长度检查之后，这份 usage 会整份丢掉。
+	// 同时它不带 choices，所以不该启动消息 —— message_start 此时还不能出现。
+	if err := emitter.Consume(StreamChunk{ID: "s1", Model: "m", Usage: &Usage{PromptTokens: 7, CompletionTokens: 4}}); err != nil {
+		t.Fatalf("Consume 失败: %v", err)
+	}
+	if len(log.events) != 0 {
+		t.Fatalf("choices 为空的 chunk 不应启动消息，实际产出 %v", log.types())
+	}
+
+	if err := emitter.Consume(textChunk("hi")); err != nil {
+		t.Fatalf("Consume 失败: %v", err)
+	}
+	// 此时 usage 已记下 7/4，但 message_start 必须仍填 0 占位 ——
+	// 真实值要等到 message_delta 才给，这是 brief 明确的时序设计。
+	startUsage := log.events[0]["message"].(map[string]any)["usage"].(map[string]any)
+	if startUsage["input_tokens"].(float64) != 0 || startUsage["output_tokens"].(float64) != 0 {
+		t.Fatalf("message_start 的 usage 必须是 0 占位，实际 %#v", startUsage)
+	}
+
+	// finish chunk 刻意不带 usage，坐实上面那个 chunk 是唯一来源。
+	noUsageFinish := StreamChunk{
+		ID:      "s1",
+		Model:   "m",
+		Choices: []StreamChoice{{Index: 0, FinishReason: "stop", Delta: StreamDelta{Role: "assistant"}}},
+	}
+	if err := emitter.Consume(noUsageFinish); err != nil {
+		t.Fatalf("Consume 失败: %v", err)
+	}
+	if err := emitter.Finish(true); err != nil {
+		t.Fatalf("Finish 失败: %v", err)
+	}
+
+	deltas := log.ofType(t, "message_delta")
+	if len(deltas) != 1 {
+		t.Fatalf("message_delta 数 = %d", len(deltas))
+	}
+	usage := deltas[0]["usage"].(map[string]any)
+	if usage["input_tokens"].(float64) != 7 || usage["output_tokens"].(float64) != 4 {
+		t.Fatalf("choices 为空的 chunk 带的 usage 必须被记下，实际 %#v", usage)
+	}
+}
+
+func TestEventEmitterMessageIDShape(t *testing.T) {
+	t.Parallel()
+
+	// id 形态由 newMessageID 统一构造，流式与非流式共用，所以这里锁住的是两条路径的形态。
+	cases := []struct{ name, upstreamID, want string }{
+		{"带上游 id", "s1", "msg_s1"},
+		{"上游未给 id", "", "msg_ark"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			log := &eventLog{}
+			emitter := NewEventEmitter("m", false, log.emit)
+			chunk := StreamChunk{
+				ID:      tc.upstreamID,
+				Model:   "m",
+				Choices: []StreamChoice{{Index: 0, Delta: StreamDelta{Role: "assistant", Content: "答"}}},
+			}
+			if err := emitter.Consume(chunk); err != nil {
+				t.Fatalf("Consume 失败: %v", err)
+			}
+			if got := log.events[0]["message"].(map[string]any)["id"]; got != tc.want {
+				t.Fatalf("message id = %v，期望 %q", got, tc.want)
+			}
+		})
 	}
 }
 
