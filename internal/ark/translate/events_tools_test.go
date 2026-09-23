@@ -424,8 +424,13 @@ func TestEventEmitterIncompleteToolStartFails(t *testing.T) {
 		Model:   "m",
 		Choices: []StreamChoice{{Index: 0, Delta: StreamDelta{ToolCalls: []StreamToolCall{call}}}},
 	}
-	if err := emitter.Consume(chunk); err == nil {
+	err := emitter.Consume(chunk)
+	if err == nil {
 		t.Fatal("缺 name 的工具首发分片必须报错")
+	}
+	// 错误必须点名缺的是 name，措辞与非流式 BuildResponse 的同一守卫保持一致。
+	if !strings.Contains(err.Error(), "缺少 name") || strings.Contains(err.Error(), " id") {
+		t.Fatalf("错误应点名缺少的是 name 且不提 id，实际 %v", err)
 	}
 }
 
@@ -448,8 +453,13 @@ func TestEventEmitterToolStartWithoutIDFails(t *testing.T) {
 		Model:   "m",
 		Choices: []StreamChoice{{Index: 0, Delta: StreamDelta{ToolCalls: []StreamToolCall{call}}}},
 	}
-	if err := emitter.Consume(chunk); err == nil {
+	err := emitter.Consume(chunk)
+	if err == nil {
 		t.Fatal("缺 id 的工具首发分片必须报错")
+	}
+	// 同时不得提到 name，理由同非流式那条：不可区分的措辞含「缺少 id」子串。
+	if !strings.Contains(err.Error(), "缺少 id") || strings.Contains(err.Error(), "name") {
+		t.Fatalf("错误应点名缺少的是 id 且不提 name，实际 %v", err)
 	}
 }
 

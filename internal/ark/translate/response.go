@@ -129,9 +129,13 @@ func BuildResponse(payload []byte, modelID string, includeThinking bool) ([]byte
 		// 两个字段都带 omitempty：上游给空 id 或空 name 时，那个字段会在序列化结果里整个
 		// 消失，客户端拿到一个无法执行、也无法回传结果的 tool_use 块，而网关一声不响。
 		// 这里硬失败而不是填占位符 —— 宁可报错，也不要把损坏数据转发给客户端。
-		// 与流式 openToolBlock 的守卫是同一条语义，两条路径必须一致。
-		if call.ID == "" || call.Function.Name == "" {
-			return nil, fmt.Errorf("tool_calls[%d] 缺少 id 或 name", index)
+		// 与流式 openToolBlock 的守卫是同一条语义，两条路径必须一致（含错误措辞）。
+		// 分开两条判断只为点名实际缺失的字段：这条错误是运维在 5xx 里唯一能看到的信息。
+		if call.ID == "" {
+			return nil, fmt.Errorf("tool_calls[%d] 缺少 id", index)
+		}
+		if call.Function.Name == "" {
+			return nil, fmt.Errorf("tool_calls[%d] 缺少 name", index)
 		}
 		input := json.RawMessage(call.Function.Arguments)
 		if len(input) == 0 {

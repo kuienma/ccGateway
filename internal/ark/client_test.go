@@ -81,6 +81,41 @@ func TestInvokeTranslatesBothDirections(t *testing.T) {
 	}
 }
 
+// TestInvokeFallsBackToRequestedModelWhenUpstreamOmitsModel 钉住 Invoke 与 BuildResponse
+// 之间的**接线**，而不是 BuildResponse 这个函数本身。
+//
+// model 空值回落的全部生产价值都在 Invoke 里那一行实参上：把它写成 ""（重构漏传、
+// 或有人以为该字段没用）产出的就是 "model":""。translate 包里那条用例测的是函数，
+// 而本包其余用例的假上游全部硬编码 "model":"m"，回落分支在 client 层永远走不到，
+// 结构上抓不到这类回归 —— 所以这条用例必须让上游**不回显** model。
+func TestInvokeFallsBackToRequestedModelWhenUpstreamOmitsModel(t *testing.T) {
+	t.Parallel()
+
+	const requestedModel = "deepseek-v4-flash-ga-260731"
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// 上游刻意不带 model 字段。
+		_, _ = w.Write([]byte(`{"id":"r1","choices":[{"finish_reason":"stop",
+			"message":{"role":"assistant","content":"你好"}}],
+			"usage":{"prompt_tokens":5,"completion_tokens":2}}`))
+	})
+
+	out, err := client.Invoke(context.Background(), requestedModel,
+		[]byte(`{"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("Invoke 失败: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("返回值不是合法 JSON: %v", err)
+	}
+	if decoded["model"] != requestedModel {
+		t.Fatalf("上游不回显 model 时，返回体的 model 应回落到请求的 %q，实际 %v",
+			requestedModel, decoded["model"])
+	}
+}
+
 func TestInvokeRejectsImageBeforeCallingUpstream(t *testing.T) {
 	t.Parallel()
 

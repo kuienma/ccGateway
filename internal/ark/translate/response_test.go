@@ -259,6 +259,12 @@ func TestBuildResponseRejectsToolCallWithoutID(t *testing.T) {
 	if err == nil {
 		t.Fatalf("tool_calls 缺 id 必须报错，不能产出缺字段的 tool_use 块，实际产出 %s", out)
 	}
+	// 错误必须点名缺的是 id：这句话是运维在 5xx 里唯一能看到的信息。
+	// 同时不得提到 name —— 「缺少 id 或 name」这种不可区分的措辞包含「缺少 id」子串，
+	// 只查前半句会让它蒙混过关。
+	if !strings.Contains(err.Error(), "缺少 id") || strings.Contains(err.Error(), "name") {
+		t.Fatalf("错误应点名缺少的是 id 且不提 name，实际 %v", err)
+	}
 }
 
 // TestBuildResponseRejectsToolCallWithoutName 是上一条的镜像：name 同样必填。
@@ -269,6 +275,9 @@ func TestBuildResponseRejectsToolCallWithoutName(t *testing.T) {
 	out, err := BuildResponse(toolIdentityResponse(t, "call_1", ""), gatewayModelID, false)
 	if err == nil {
 		t.Fatalf("tool_calls 缺 name 必须报错，不能产出缺字段的 tool_use 块，实际产出 %s", out)
+	}
+	if !strings.Contains(err.Error(), "缺少 name") || strings.Contains(err.Error(), " id") {
+		t.Fatalf("错误应点名缺少的是 name 且不提 id，实际 %v", err)
 	}
 }
 

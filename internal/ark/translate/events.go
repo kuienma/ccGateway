@@ -232,8 +232,12 @@ func (e *EventEmitter) consumeToolCalls(calls []StreamToolCall) error {
 // 这里的 call.ID 是工具调用 id（形如 call_xxx），与消息 id 无关：
 // 它原样进 tool_use 块，不能套 newMessageID 的 msg_ 前缀。
 func (e *EventEmitter) openToolBlock(call StreamToolCall) error {
-	if call.ID == "" || call.Function.Name == "" {
-		return fmt.Errorf("tool_calls[%d] 首发分片缺少 id 或 name", call.Index)
+	// 分开两条判断只为点名实际缺失的字段，措辞与非流式 BuildResponse 的同一守卫保持一致。
+	if call.ID == "" {
+		return fmt.Errorf("tool_calls[%d] 首发分片缺少 id", call.Index)
+	}
+	if call.Function.Name == "" {
+		return fmt.Errorf("tool_calls[%d] 首发分片缺少 name", call.Index)
 	}
 	if _, exists := e.toolBlocks[call.Index]; exists {
 		return fmt.Errorf("tool_calls[%d] 出现重复的首发分片", call.Index)
