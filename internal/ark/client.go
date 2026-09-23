@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/anthropic"
@@ -29,17 +30,24 @@ type Config struct {
 }
 
 type Client struct {
-	apiKey  string
+	apiKey string
+	// baseURL 已去掉尾斜杠，拼 completionsPath 时不会产生双斜杠。
 	baseURL string
+	// timeout 是非流式请求的总时长上限，由 Invoke 施加在 context 上。
+	// 流式路径刻意不用它：长回复的生命周期只由调用方的 context 控制。
+	timeout time.Duration
 	http    *http.Client
 }
 
 func NewClient(cfg Config) *Client {
 	return &Client{
-		apiKey:  cfg.APIKey,
-		baseURL: cfg.BaseURL,
-		// 流式请求依赖 context 控制生命周期，这里不设 http.Client.Timeout，
-		// 否则长流会被硬截断；超时通过 Config.Timeout 施加在非流式路径上。
+		apiKey: cfg.APIKey,
+		// 运维可能把 ARK_BASE_URL 写成 ".../api/v3/"，带尾斜杠会拼出
+		// //chat/completions，真实 Ark 会返回 404，这里统一归一化。
+		baseURL: strings.TrimSuffix(cfg.BaseURL, "/"),
+		timeout: cfg.Timeout,
+		// 不设 http.Client.Timeout：它对流式与非流式一视同仁，会把长流硬截断。
+		// 非流式的总时长上限由 Invoke 用 context.WithTimeout 单独施加。
 		http: &http.Client{Transport: newTransport(cfg.Timeout)},
 	}
 }
@@ -48,6 +56,7 @@ func newTransport(timeout time.Duration) http.RoundTripper {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if timeout > 0 {
 		// 只约束拿到响应头的时间，不约束读流式 body 的总时长。
+		// 非流式还需要一个总时长上限，见 Invoke。
 		transport.ResponseHeaderTimeout = timeout
 	}
 	transport.MaxIdleConnsPerHost = 20
@@ -86,6 +95,15 @@ func (e *rejectionError) Kind() string { return e.rejection.Kind }
 func (e *rejectionError) ClientMessage() string { return e.rejection.Message }
 
 func (c *Client) Invoke(ctx context.Context, modelID string, body []byte) ([]byte, error) {
+	// 非流式请求不需要长连接，给它一个总时长上限。
+	// 只靠 Transport.ResponseHeaderTimeout 是不够的：响应头一到，下面的 io.ReadAll
+	// 就再无期限，而 HTTP 层没有设置任何 deadline，请求 context 只在客户端断开时取消。
+	if c.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
+
 	response, err := c.post(ctx, modelID, body, false)
 	if err != nil {
 		return nil, err
@@ -179,6 +197,8 @@ func kindForStatus(status int) string {
 }
 
 // Stream 在 Task 10 实现。
+// 实现时不要套用 Invoke 的 c.timeout：流式生命周期只由传入的 context 控制，
+// 加总时长上限会把长回复硬截断。
 func (c *Client) Stream(ctx context.Context, modelID string, body []byte, emit func([]byte) error) error {
 	return fmt.Errorf("ark 流式调用尚未实现")
 }

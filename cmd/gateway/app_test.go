@@ -51,10 +51,21 @@ func TestBuildProvidersRequiresArkKeyOnlyWhenArkModelRegistered(t *testing.T) {
 		t.Fatalf("纯 bedrock 目录不应要求 Ark 凭证: %v", err)
 	}
 	if _, exists := providers[llm.ProviderArk]; exists {
-		t.Fatal("未登记 ark 模型时不应装配 ark provider")
+		t.Fatal("既无凭证又未登记 ark 模型时不应装配 ark provider")
 	}
 	if _, exists := providers[llm.ProviderBedrock]; !exists {
 		t.Fatal("bedrock provider 必须始终装配")
+	}
+
+	// 有凭证就装配，与目录当前是否登记 ark 模型无关：models.Reload 挂在 SIGHUP 上，
+	// 运维随时可能热加 ark 模型，而 providers 表是启动时定死的 map，
+	// 若按目录内容决定是否装配，热加后的 ark 请求会永远拿到 500 且只能靠重启恢复。
+	providers, err = buildProviders(config.Config{ArkAPIKey: "secret"}, bedrockOnly, nil)
+	if err != nil {
+		t.Fatalf("有凭证时装配失败: %v", err)
+	}
+	if _, exists := providers[llm.ProviderArk]; !exists {
+		t.Fatal("有 ARK_API_KEY 时应装配 ark provider，以便 SIGHUP 热加 ark 模型后立即可用")
 	}
 
 	withArk := newManager(t, `{"default":"a","models":[{"id":"a"},{"id":"b","provider":"ark"}]}`)

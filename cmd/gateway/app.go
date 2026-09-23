@@ -46,15 +46,22 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	return runServer(ctx, server, models.Reload, cfg.ShutdownTimeout, logger)
 }
 
-// buildProviders 按模型目录实际用到的 provider 装配实现。
-// 目录里登记了 ark 模型却没有凭证时直接启动失败，不留到首个请求才报错。
+// buildProviders 装配 provider 表。
+//
+// 装配条件是「有凭证」而不是「目录里现在用到了」：providers 表在启动时定死，
+// 而 models.Reload 挂在 SIGHUP 上可以在运行期热加模型。若按目录内容决定是否装配，
+// 启动时没有 ark 模型的部署在热加 ark 模型之后会永远拿到
+// 「模型所属 provider 未启用: ark」，即使 ARK_API_KEY 早已配好，也只能靠重启恢复。
+//
+// 同时保留快速失败：目录里已经登记了 ark 模型却没有凭证时直接启动失败，
+// 不留到首个请求才报错。
 func buildProviders(cfg config.Config, models *modelcatalog.Manager, runtime bedrock.Runtime) (map[string]llm.Provider, error) {
 	providers := map[string]llm.Provider{llm.ProviderBedrock: runtime}
-	if !models.UsesProvider(llm.ProviderArk) {
-		return providers, nil
-	}
 	if cfg.ArkAPIKey == "" {
-		return nil, fmt.Errorf("模型配置登记了 ark 模型，必须设置 ARK_API_KEY")
+		if models.UsesProvider(llm.ProviderArk) {
+			return nil, fmt.Errorf("模型配置登记了 ark 模型，必须设置 ARK_API_KEY")
+		}
+		return providers, nil
 	}
 	providers[llm.ProviderArk] = ark.NewClient(ark.Config{
 		APIKey:  cfg.ArkAPIKey,

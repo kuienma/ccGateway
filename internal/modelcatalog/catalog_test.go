@@ -174,6 +174,21 @@ func TestRepositoryModelsConfigIsValid(t *testing.T) {
 	if defaultResolution.Provider != llm.ProviderBedrock {
 		t.Fatalf("缺省模型 provider = %q，期望 bedrock", defaultResolution.Provider)
 	}
+
+	// 登记方向同样要守：有人把 "provider":"ark" 误改成 bedrock（或删掉该字段，
+	// 从而缺省成 bedrock）时，上面的断言不会响，必须在这里拦住。
+	for _, name := range []string{"deepseek-v4-flash-ga-260731", "deepseek-v4-flash", "ds-flash"} {
+		resolved, ok := catalog.Resolve(name)
+		if !ok {
+			t.Fatalf("真实配置中 %q 应可解析", name)
+		}
+		if resolved.Provider != llm.ProviderArk {
+			t.Fatalf("%q 的 provider = %q，期望 ark", name, resolved.Provider)
+		}
+		if resolved.ModelID != "deepseek-v4-flash-ga-260731" {
+			t.Fatalf("%q 的 ModelID = %q", name, resolved.ModelID)
+		}
+	}
 }
 
 func TestParseRejectsUnknownProvider(t *testing.T) {
