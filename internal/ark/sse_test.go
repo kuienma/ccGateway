@@ -10,11 +10,32 @@ import (
 )
 
 // 取自 2026-09-22 对 Ark 的真实流式响应（见设计文档 §2）。
+//
+// 参数分片是**完整的八片**，与设计文档 §2 记的真机分帧逐片一致：
+// `{"city": "` → `北京` → `"` → `, "unit": "` → `c` → `elsius` → `"` → `}`。
+// 早先这里只留了第一片就直接跳到 finish_reason，那等于让 fixture 断言
+// 「拼起来是半截 JSON 的 arguments 也算正常流」—— 真机从来不是这样，而流式
+// arguments 对象守卫（events.go validateOpenToolArgs）补上后，那份删减恰好会
+// 把守卫顶掉。fixture 自称取自真机，就必须把真机那几片都留着。
 const arkToolStream = `data: {"choices":[{"delta":{"content":"","reasoning_content":"The","role":"assistant"},"index":0}],"id":"s1","model":"m","object":"chat.completion.chunk","usage":null}
 
 data: {"choices":[{"delta":{"content":"","role":"assistant","tool_calls":[{"function":{"arguments":"","name":"get_weather"},"id":"call_1","index":0,"type":"function"}]},"index":0}],"id":"s1","model":"m","object":"chat.completion.chunk","usage":null}
 
 data: {"choices":[{"delta":{"content":"","role":"assistant","tool_calls":[{"function":{"arguments":"{\"city\": \""},"index":0}]},"index":0}],"id":"s1","model":"m","object":"chat.completion.chunk","usage":null}
+
+data: {"choices":[{"delta":{"content":"","role":"assistant","tool_calls":[{"function":{"arguments":"北京"},"index":0}]},"index":0}],"id":"s1","model":"m","object":"chat.completion.chunk","usage":null}
+
+data: {"choices":[{"delta":{"content":"","role":"assistant","tool_calls":[{"function":{"arguments":"\""},"index":0}]},"index":0}],"id":"s1","model":"m","object":"chat.completion.chunk","usage":null}
+
+data: {"choices":[{"delta":{"content":"","role":"assistant","tool_calls":[{"function":{"arguments":", \"unit\": \""},"index":0}]},"index":0}],"id":"s1","model":"m","object":"chat.completion.chunk","usage":null}
+
+data: {"choices":[{"delta":{"content":"","role":"assistant","tool_calls":[{"function":{"arguments":"c"},"index":0}]},"index":0}],"id":"s1","model":"m","object":"chat.completion.chunk","usage":null}
+
+data: {"choices":[{"delta":{"content":"","role":"assistant","tool_calls":[{"function":{"arguments":"elsius"},"index":0}]},"index":0}],"id":"s1","model":"m","object":"chat.completion.chunk","usage":null}
+
+data: {"choices":[{"delta":{"content":"","role":"assistant","tool_calls":[{"function":{"arguments":"\""},"index":0}]},"index":0}],"id":"s1","model":"m","object":"chat.completion.chunk","usage":null}
+
+data: {"choices":[{"delta":{"content":"","role":"assistant","tool_calls":[{"function":{"arguments":"}"},"index":0}]},"index":0}],"id":"s1","model":"m","object":"chat.completion.chunk","usage":null}
 
 data: {"choices":[{"delta":{"content":"","role":"assistant"},"finish_reason":"tool_calls","index":0}],"id":"s1","model":"m","object":"chat.completion.chunk","usage":{"completion_tokens":81,"prompt_tokens":397}}
 
@@ -37,8 +58,8 @@ func TestScanSSEParsesRealStream(t *testing.T) {
 	if !sawDone {
 		t.Fatal("应识别到 [DONE]")
 	}
-	if len(chunks) != 5 {
-		t.Fatalf("chunk 数 = %d，期望 5（[DONE] 不产出 chunk）", len(chunks))
+	if len(chunks) != 12 {
+		t.Fatalf("chunk 数 = %d，期望 12（[DONE] 不产出 chunk）", len(chunks))
 	}
 
 	if chunks[0].Choices[0].Delta.ReasoningContent != "The" {
@@ -61,13 +82,27 @@ func TestScanSSEParsesRealStream(t *testing.T) {
 		t.Fatal("后续分片不带 id，解析器不应凭空补值")
 	}
 
-	if chunks[3].Choices[0].FinishReason != "tool_calls" {
-		t.Fatalf("finish_reason = %q", chunks[3].Choices[0].FinishReason)
+	// 八片拼完必须是一个合法的 JSON 对象 —— 这是真机的事实，也是流式 arguments
+	// 守卫（validateOpenToolArgs）所依赖的前提。在 fixture 层面锁住它，后人再删减
+	// 分片时会在这里先失败，而不是把那个守卫悄悄顶掉。
+	var joined string
+	for _, chunk := range chunks {
+		if len(chunk.Choices) == 0 || len(chunk.Choices[0].Delta.ToolCalls) == 0 {
+			continue
+		}
+		joined += chunk.Choices[0].Delta.ToolCalls[0].Function.Arguments
 	}
-	if chunks[4].Usage == nil || chunks[4].Usage.PromptTokens != 397 {
-		t.Fatalf("末尾 usage chunk = %#v", chunks[4].Usage)
+	if joined != `{"city": "北京", "unit": "celsius"}` {
+		t.Fatalf("参数分片拼接结果 = %q，与设计文档 §2 记的真机分帧不一致", joined)
 	}
-	if len(chunks[4].Choices) != 0 {
+
+	if chunks[10].Choices[0].FinishReason != "tool_calls" {
+		t.Fatalf("finish_reason = %q", chunks[10].Choices[0].FinishReason)
+	}
+	if chunks[11].Usage == nil || chunks[11].Usage.PromptTokens != 397 {
+		t.Fatalf("末尾 usage chunk = %#v", chunks[11].Usage)
+	}
+	if len(chunks[11].Choices) != 0 {
 		t.Fatal("末尾 usage chunk 的 choices 应为空")
 	}
 }

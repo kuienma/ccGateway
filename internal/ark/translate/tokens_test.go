@@ -225,8 +225,11 @@ func TestEstimateTokensIncludesToolDefinitions(t *testing.T) {
 	// 变异验证时发现那个倍率并不由 schema 是否计入决定（固定开销一进 bare，倍率就跟着
 	// 变），承诺强于实际验证，遂改成直接量 schema 的贡献。
 	if int(tooled-bare) < len(schema)/3 {
-		t.Fatalf("input_schema 的贡献只有 %d token，低于其文本量下界 %d —— "+
-			"name/description/input_schema 必须全部计入", tooled-bare, len(schema)/3)
+		t.Fatalf("带工具与不带工具的估算差只有 %d token，低于 input_schema 的文本量下界 %d —— "+
+			"工具定义必须显著计入估算。注意本条守的是「增量够大」这个量级属性，"+
+			"而这个增量里 perToolOverhead 占绝对主体；"+
+			"「name / description / input_schema 逐项都计入」由 TestEstimateTokensCountsToolText 守"+
+			"（它把固定开销相减抵消，与该常量取值无关）", tooled-bare, len(schema)/3)
 	}
 }
 
@@ -332,9 +335,10 @@ func estimateWithSingleTool(t *testing.T, toolJSON string) int {
 // 增量里固定开销占绝对主体（实测 300，而这份定义的文本只值 32）。于是把 tokens.go 里收集
 // 工具文本的那个循环整段删掉、**同时**把 perToolOverhead 调到 400（仍落在那两条用例允许的
 // 窗口 [276, 584] 内）→ 九个包全绿（本任务实测）。单删循环时也只靠 `300 < 308` 剩下的
-// 8 个 token 余量才被抓住 —— 而 `TestEstimateTokensIncludesToolDefinitions` 的失败消息
+// 8 个 token 余量才被抓住 —— 而 `TestEstimateTokensIncludesToolDefinitions` 的失败消息一度
 // 声称守的就是「name/description/input_schema 必须全部计入」，它的下界 33 早被 300 的固定
-// 开销吞掉，承诺强于实际。
+// 开销吞掉，承诺强于实际。那条消息已经改成只声称「增量够大」并把逐项属性指回本用例
+// （合并前最后一轮 fix，A4/T3d），但分工本身没变：量级属性在那边，逐字段属性在这里。
 //
 // 更要紧的是这是个**定时炸弹**：perToolOverhead 被明确标注「单点数据，待真机多点校准」，
 // 下次有人把它校准到 >308，「工具文本计入」这个属性就会在校准的同一刻静默失去护栏。

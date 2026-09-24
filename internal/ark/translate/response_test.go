@@ -281,6 +281,45 @@ func TestBuildResponseRejectsToolCallWithoutName(t *testing.T) {
 	}
 }
 
+// twoToolCallsResponse 造一个带两个 tool_call 的响应，两个 id 由调用方指定。
+func twoToolCallsResponse(firstID, secondID string) []byte {
+	return []byte(`{"id":"r","model":"m","choices":[{"finish_reason":"tool_calls",` +
+		`"message":{"role":"assistant","content":"","tool_calls":[` +
+		`{"id":"` + firstID + `","type":"function","function":{"name":"f","arguments":"{}"}},` +
+		`{"id":"` + secondID + `","type":"function","function":{"name":"g","arguments":"{}"}}]}}],` +
+		`"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+}
+
+// TestBuildResponseRejectsDuplicateToolCallIDs 拦上游在一次响应里给两个不同的工具调用
+// 下发同一个 id。原样透出会让客户端把两次调用当成一次（只回一个 tool_result），
+// 第二个工具的结果永远回不去，表现为「模型重复调用同一个工具」，静默且极难定位到网关。
+// 与流式 openToolBlock 的同一守卫保持一致（含错误措辞）。
+func TestBuildResponseRejectsDuplicateToolCallIDs(t *testing.T) {
+	t.Parallel()
+
+	out, err := BuildResponse(twoToolCallsResponse("call_same", "call_same"), gatewayModelID, false)
+	if err == nil {
+		t.Fatalf("重复的 tool_use id 必须报错，实际产出 %s", out)
+	}
+	if !strings.Contains(err.Error(), "重复") || !strings.Contains(err.Error(), "call_same") {
+		t.Fatalf("错误应点名重复的 id，实际 %v", err)
+	}
+}
+
+// TestBuildResponseAcceptsDistinctToolCallIDs 是上一条的反面：真机形态的并行工具
+// （两个 id 不同）不能被误伤。
+func TestBuildResponseAcceptsDistinctToolCallIDs(t *testing.T) {
+	t.Parallel()
+
+	out, err := BuildResponse(twoToolCallsResponse("call_a", "call_b"), gatewayModelID, false)
+	if err != nil {
+		t.Fatalf("id 不同的并行工具调用不应报错: %v", err)
+	}
+	if content := decodeAnthropicResponse(t, out)["content"].([]any); len(content) != 2 {
+		t.Fatalf("应产出两个 tool_use 块，实际 %d 个", len(content))
+	}
+}
+
 // Anthropic 的 tool_use.input 必须是对象。合法但非对象的 JSON（尤其 null）
 // 会让客户端走空指针路径而不是报类型错误，必须在网关这一层拦掉。
 func TestBuildResponseRejectsNonObjectToolArguments(t *testing.T) {

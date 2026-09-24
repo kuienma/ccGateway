@@ -381,9 +381,11 @@ func TestEventEmitterInterleavedToolFragmentsFail(t *testing.T) {
 	log := &eventLog{}
 	emitter := NewEventEmitter("m", false, log.emit)
 
+	// 工具 0 的参数刻意给成**已经拼完整**的对象：否则关块时 validateOpenToolArgs
+	// 会先以「arguments 必须是 JSON 对象」失败，这条用例就测不到交错守卫本身了。
 	chunks := []StreamChunk{
 		toolStartChunk(0, "call_a", "f"),
-		toolArgChunk(0, `{"x":`),
+		toolArgChunk(0, `{"x":1}`),
 		toolStartChunk(1, "call_b", "g"), // 工具 0 的块在此被关闭
 	}
 	for _, chunk := range chunks {
@@ -393,8 +395,12 @@ func TestEventEmitterInterleavedToolFragmentsFail(t *testing.T) {
 	}
 
 	// 回头再给工具 0 的分片 —— 它的块已关闭，无法再追加，必须报错。
-	if err := emitter.Consume(toolArgChunk(0, `1}`)); err == nil {
+	err := emitter.Consume(toolArgChunk(0, `{"y":2}`))
+	if err == nil {
 		t.Fatal("交错的参数分片必须报错（详见任务说明的备选缓冲方案）")
+	}
+	if !strings.Contains(err.Error(), "交错") {
+		t.Fatalf("错误应出自交错守卫，实际 %v", err)
 	}
 }
 
@@ -520,5 +526,183 @@ func TestEventEmitterBlockStartStopAlwaysPaired(t *testing.T) {
 	}
 	if last := log.types()[len(log.types())-1]; last != "message_stop" {
 		t.Fatalf("message_stop 必须是末个事件，实际 %q", last)
+	}
+}
+
+// TestEventEmitterRejectsNonObjectToolArguments 是流式 arguments 对象守卫的护栏。
+//
+// 补这条守卫之前，同一份损坏输入的两条路径是分叉的：非流式 BuildResponse 硬失败
+// （「宁可报错，也不要把损坏数据转发给客户端」），流式**静默转发** —— 客户端拿到一个
+// input 为 null 或半截 JSON 的 tool_use 块，Anthropic SDK 的 JSON 累加器要么报解析错、
+// 要么给出 null input，工具执行失败且排查方向不会指向网关。
+//
+// 用例刻意把 null 拆成两片投递：守卫必须在「拼完之后」判断，不能看单片。
+func TestEventEmitterRejectsNonObjectToolArguments(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		fragments []string
+	}{
+		{"null 分两片", []string{"nu", "ll"}},
+		{"半截 JSON", []string{`{"city": "`, "北京"}},
+		{"只有左括号", []string{"{"}},
+		{"数组", []string{"[1,2]"}},
+		{"数字标量", []string{"123"}},
+		{"字符串标量", []string{`"abc"`}},
+		{"布尔", []string{"true"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			log := &eventLog{}
+			emitter := NewEventEmitter("m", false, log.emit)
+			if err := emitter.Consume(toolStartChunk(0, "call_1", "get_weather")); err != nil {
+				t.Fatalf("Consume 失败: %v", err)
+			}
+			for _, fragment := range tc.fragments {
+				if err := emitter.Consume(toolArgChunk(0, fragment)); err != nil {
+					t.Fatalf("参数分片必须原样转发、不中途解析，实际报错 %v", err)
+				}
+			}
+			// 守卫在关块时触发，所以错误从收尾这一步冒出来。
+			err := emitter.Consume(finishChunk("tool_calls", 397, 81))
+			if err == nil {
+				t.Fatalf("arguments 拼起来是 %q（不是 JSON 对象），必须报错而不是静默转发",
+					strings.Join(tc.fragments, ""))
+			}
+			if !strings.Contains(err.Error(), "必须是 JSON 对象") {
+				t.Fatalf("错误应出自 arguments 对象守卫，实际 %v", err)
+			}
+			// 客户端绝不能收到一个「完整但不可执行」的块：报错前不得写出 content_block_stop。
+			if stops := log.ofType(t, "content_block_stop"); len(stops) != 0 {
+				t.Fatalf("报错前不得关闭损坏的 tool_use 块，实际写出了 %d 个 content_block_stop", len(stops))
+			}
+		})
+	}
+}
+
+// TestEventEmitterRejectsNonObjectToolArgumentsWhenNextToolOpens 覆盖另一条关块路径。
+//
+// tool_use 块有两种关法：收到 finish_reason（上一条用例）与下一个块开启（这一条）。
+// 只测前者的话，把校验挪进 complete() 而不放在 closeOpenBlock 的变异照样全绿，
+// 而并行工具恰恰走后一条路径 —— 第一个工具的损坏参数会被静默放过。
+func TestEventEmitterRejectsNonObjectToolArgumentsWhenNextToolOpens(t *testing.T) {
+	t.Parallel()
+
+	log := &eventLog{}
+	emitter := NewEventEmitter("m", false, log.emit)
+
+	if err := emitter.Consume(toolStartChunk(0, "call_a", "f")); err != nil {
+		t.Fatalf("Consume 失败: %v", err)
+	}
+	if err := emitter.Consume(toolArgChunk(0, "null")); err != nil {
+		t.Fatalf("参数分片必须原样转发，实际报错 %v", err)
+	}
+	// 第二个工具首发 → 关闭第一个工具的块 → 校验必须在这一刻触发。
+	err := emitter.Consume(toolStartChunk(1, "call_b", "g"))
+	if err == nil {
+		t.Fatal("下一个工具开块时必须校验上一个工具拼完的 arguments")
+	}
+	if !strings.Contains(err.Error(), "必须是 JSON 对象") {
+		t.Fatalf("错误应出自 arguments 对象守卫，实际 %v", err)
+	}
+}
+
+// TestEventEmitterAcceptsObjectToolArguments 是上面两条的反面：正常形态不能被误伤。
+// 尤其「一个参数分片都没有」这种形态（工具无参数）必须放行 —— content_block_start
+// 里已经填了 input:{}，与非流式把空 arguments 当作 {} 的处理一致。
+func TestEventEmitterAcceptsObjectToolArguments(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		fragments []string
+	}{
+		{"无参数（一个分片都没有）", nil},
+		{"空对象", []string{"{}"}},
+		{"真机分帧", []string{`{"city": "`, "北京", `"`, `, "unit": "`, "c", "elsius", `"`, "}"}},
+		{"分片带前后空白", []string{" ", `{"a":1}`, " "}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			log := &eventLog{}
+			emitter := NewEventEmitter("m", false, log.emit)
+			if err := emitter.Consume(toolStartChunk(0, "call_1", "get_weather")); err != nil {
+				t.Fatalf("Consume 失败: %v", err)
+			}
+			for _, fragment := range tc.fragments {
+				if err := emitter.Consume(toolArgChunk(0, fragment)); err != nil {
+					t.Fatalf("Consume 失败: %v", err)
+				}
+			}
+			if err := emitter.Consume(finishChunk("tool_calls", 397, 81)); err != nil {
+				t.Fatalf("合法 arguments 不应报错: %v", err)
+			}
+			if err := emitter.Finish(true); err != nil {
+				t.Fatalf("Finish 失败: %v", err)
+			}
+			if last := log.types()[len(log.types())-1]; last != "message_stop" {
+				t.Fatalf("末个事件 = %q，期望 message_stop", last)
+			}
+		})
+	}
+}
+
+// TestEventEmitterDuplicateToolIDAcrossIndexesFails 拦上游在一次响应里给两个不同的
+// 工具调用下发同一个 id。
+//
+// 既有的 toolBlocks 守卫只覆盖「同一 tool index 重复首发」，跨 index 的 id 重复它看不见：
+// 补这条之前网关会原样透出两个 id 相同的 tool_use 块，客户端把两次调用当成一次
+// （只回一个 tool_result），第二个工具的结果永远回不去，表现为「模型重复调用同一个工具」，
+// 静默且极难定位到网关。选择报错而不是改写 id：改写后客户端回传的 tool_result 带的是
+// 我们伪造的 id，而网关无状态，下一轮请求里无法还原成上游认得的那个 id。
+func TestEventEmitterDuplicateToolIDAcrossIndexesFails(t *testing.T) {
+	t.Parallel()
+
+	log := &eventLog{}
+	emitter := NewEventEmitter("m", false, log.emit)
+
+	if err := emitter.Consume(toolStartChunk(0, "call_same", "f")); err != nil {
+		t.Fatalf("Consume 失败: %v", err)
+	}
+	if err := emitter.Consume(toolArgChunk(0, `{"a":1}`)); err != nil {
+		t.Fatalf("Consume 失败: %v", err)
+	}
+	// 不同的 tool index，却是同一个 call id。
+	err := emitter.Consume(toolStartChunk(1, "call_same", "g"))
+	if err == nil {
+		t.Fatal("跨 index 的重复 tool_use id 必须报错，不能原样透出两个 id 相同的块")
+	}
+	if !strings.Contains(err.Error(), "重复") || !strings.Contains(err.Error(), "call_same") {
+		t.Fatalf("错误应点名重复的 id，实际 %v", err)
+	}
+}
+
+// TestEventEmitterDistinctToolIDsPass 是上一条的反面：真机形态（两个 id 不同的并行工具）
+// 不能被误伤 —— 只有上一条时，把守卫写成「见到第二个工具就报错」也算通过。
+func TestEventEmitterDistinctToolIDsPass(t *testing.T) {
+	t.Parallel()
+
+	log := &eventLog{}
+	emitter := NewEventEmitter("m", false, log.emit)
+
+	chunks := []StreamChunk{
+		toolStartChunk(0, "call_a", "f"),
+		toolArgChunk(0, `{"a":1}`),
+		toolStartChunk(1, "call_b", "g"),
+		toolArgChunk(1, `{"b":2}`),
+		finishChunk("tool_calls", 397, 81),
+	}
+	for _, chunk := range chunks {
+		if err := emitter.Consume(chunk); err != nil {
+			t.Fatalf("Consume 失败: %v", err)
+		}
+	}
+	if starts := log.ofType(t, "content_block_start"); len(starts) != 2 {
+		t.Fatalf("应产出两个 tool_use 块，实际 %d", len(starts))
 	}
 }

@@ -124,6 +124,11 @@ func BuildResponse(payload []byte, modelID string, includeThinking bool) ([]byte
 			Text: choice.Message.Content,
 		})
 	}
+	// seenToolIDs 拦跨调用的 id 重复：Ark 若在一次响应里给两个不同的工具调用下发同一个 id，
+	// 客户端会把两次调用当成一次（只回一个 tool_result），第二个工具的结果永远回不去，
+	// 表现为「模型重复调用同一个工具」，静默且极难定位到网关。
+	// 与流式 openToolBlock 的同一守卫保持一致（含错误措辞）。
+	seenToolIDs := make(map[string]bool, len(choice.Message.ToolCalls))
 	for index, call := range choice.Message.ToolCalls {
 		// Anthropic 要求 tool_use 块的 id 与 name 双必填，而下面 responseBlock 的 ID / Name
 		// 两个字段都带 omitempty：上游给空 id 或空 name 时，那个字段会在序列化结果里整个
@@ -137,6 +142,11 @@ func BuildResponse(payload []byte, modelID string, includeThinking bool) ([]byte
 		if call.Function.Name == "" {
 			return nil, fmt.Errorf("tool_calls[%d] 缺少 name", index)
 		}
+		if seenToolIDs[call.ID] {
+			return nil, fmt.Errorf("tool_calls[%d] 的 id %q 与前面的工具调用重复，上游在一次响应里给不同调用下发了相同 id",
+				index, call.ID)
+		}
+		seenToolIDs[call.ID] = true
 		input := json.RawMessage(call.Function.Arguments)
 		if len(input) == 0 {
 			input = json.RawMessage("{}")

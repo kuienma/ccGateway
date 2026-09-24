@@ -1,6 +1,7 @@
 package translate
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 )
@@ -49,6 +50,17 @@ type EventEmitter struct {
 	// toolBlocks 把 OpenAI 的 tool_calls[].index 映射到 Anthropic 的 block index。
 	toolBlocks map[int]int
 
+	// seenToolIDs 记录本条消息已出现过的工具调用 id，用于拦跨 index 的 id 重复。
+	// toolBlocks 只能挡「同一 index 的重复首发」，挡不住两个不同 index 用同一个 id。
+	seenToolIDs map[string]bool
+
+	// openToolArgs 累积当前打开的 tool_use 块收到的 arguments 分片**字节**，
+	// 只在块关闭时整体校验一次 —— 绝不在中途解析（分片会断在转义符或多字节字符中间）。
+	openToolArgs []byte
+	// openToolCallIndex 是当前打开的 tool_use 块对应的 OpenAI tool_calls[].index，
+	// 只用于让 arguments 校验的错误信息能点名是哪个工具调用。
+	openToolCallIndex int
+
 	// sawToolUse 记录本条消息是否开过 tool_use 块，用于在 complete 里覆盖 stop_reason。
 	sawToolUse bool
 
@@ -62,6 +74,7 @@ func NewEventEmitter(modelID string, includeThinking bool, emit func([]byte) err
 		modelID:         modelID,
 		includeThinking: includeThinking,
 		toolBlocks:      make(map[int]int),
+		seenToolIDs:     make(map[string]bool),
 	}
 }
 
@@ -223,6 +236,8 @@ func (e *EventEmitter) consumeToolCalls(calls []StreamToolCall) error {
 		}); err != nil {
 			return err
 		}
+		// 分片照常原样转发，同时留一份副本供关块时校验整体形状（见 validateOpenToolArgs）。
+		e.openToolArgs = append(e.openToolArgs, call.Function.Arguments...)
 	}
 	return nil
 }
@@ -242,6 +257,12 @@ func (e *EventEmitter) openToolBlock(call StreamToolCall) error {
 	if _, exists := e.toolBlocks[call.Index]; exists {
 		return fmt.Errorf("tool_calls[%d] 出现重复的首发分片", call.Index)
 	}
+	// 跨 index 的 id 重复必须单独拦：上面那条只覆盖「同一 index 重复首发」。
+	// 与非流式 BuildResponse 的同一守卫保持一致（含错误措辞）。
+	if e.seenToolIDs[call.ID] {
+		return fmt.Errorf("tool_calls[%d] 的 id %q 与前面的工具调用重复，上游在一次响应里给不同调用下发了相同 id",
+			call.Index, call.ID)
+	}
 	if err := e.openBlockOfKind(blockKindToolUse, map[string]any{
 		"type":  blockKindToolUse,
 		"id":    call.ID,
@@ -251,6 +272,8 @@ func (e *EventEmitter) openToolBlock(call StreamToolCall) error {
 		return err
 	}
 	e.toolBlocks[call.Index] = e.openIndex
+	e.seenToolIDs[call.ID] = true
+	e.openToolCallIndex = call.Index
 	e.sawToolUse = true
 	return nil
 }
@@ -264,6 +287,8 @@ func (e *EventEmitter) openBlockOfKind(kind string, contentBlock map[string]any)
 	if err := e.closeOpenBlock(); err != nil {
 		return err
 	}
+	// 上一个块（可能是 tool_use）已经关闭并校验过，累积的参数字节到此作废。
+	e.openToolArgs = nil
 	if contentBlock == nil {
 		switch kind {
 		case blockKindThinking:
@@ -288,9 +313,45 @@ func (e *EventEmitter) closeOpenBlock() error {
 	if e.openKind == "" {
 		return nil
 	}
+	if e.openKind == blockKindToolUse {
+		if err := e.validateOpenToolArgs(); err != nil {
+			return err
+		}
+	}
 	index := e.openIndex
 	e.openKind = ""
 	return e.write(map[string]any{"type": "content_block_stop", "index": index})
+}
+
+// validateOpenToolArgs 在 tool_use 块关闭前校验拼完的 arguments 必须是 JSON 对象。
+//
+// 为什么必须有这一条：非流式 BuildResponse 对 arguments 有硬守卫（不是对象就报错，
+// 理由写在那里：「宁可报错，也不要把损坏数据转发给客户端」），流式原先没有对应守卫 ——
+// 同一份损坏输入走非流式报 5xx、走流式静默转发，客户端拿到 input 为 null 或半截 JSON 的
+// tool_use 块，工具执行失败且排查方向不会指向网关。这是本分支第 6 次「一侧有、另一侧没有」
+// 的跨路径漂移，这里把它收口。
+//
+// 时机上刻意放在 content_block_stop **之前**、而不是把分片攒起来延后转发：
+// 「arguments 分片原样转发、绝不中途解析」是本状态机的承重不变式，缓冲会改变流式形状、
+// 拖慢首字节。代价是损坏时客户端已经收到了若干 partial_json 分片，随后收到 error 事件 ——
+// 与既有的「分片交错」守卫同一契约（宁可流中途报错，也不给出一个完整但不可执行的块）。
+func (e *EventEmitter) validateOpenToolArgs() error {
+	// 上游一个分片都没给（或只给了空串）等价于「无参数」：content_block_start 里已经
+	// 填了 input:{}，与非流式把空 arguments 当作 {} 的处理一致。
+	if len(bytes.TrimSpace(e.openToolArgs)) == 0 {
+		return nil
+	}
+	// 与非流式同一条语义：不能只用 json.Valid —— 123 / "abc" / [1,2] / true / null
+	// 都是合法 JSON，放过去客户端就拿到非对象的 input。
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(e.openToolArgs, &probe); err != nil {
+		return fmt.Errorf("tool_calls[%d].function.arguments 必须是 JSON 对象: %w", e.openToolCallIndex, err)
+	}
+	// JSON null 解进 map 是合法的 no-op（不报错，probe 为 nil），必须单独拦。
+	if probe == nil {
+		return fmt.Errorf("tool_calls[%d].function.arguments 必须是 JSON 对象，实际为 null", e.openToolCallIndex)
+	}
+	return nil
 }
 
 // complete 关闭当前块并收尾整条消息。
