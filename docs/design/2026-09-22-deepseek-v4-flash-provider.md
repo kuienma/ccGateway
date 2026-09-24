@@ -2,7 +2,7 @@
 
 - 日期：2026-09-22
 - 目标：让 Claude Code 能通过本网关调用 DeepSeek V4 Flash，复用现有鉴权、并发控制与 SSE 心跳机制
-- 状态：待评审
+- 状态：已实施（§11 的未决问题已回填实测结论，未验证项见文末）
 
 ## 1. 背景
 
@@ -156,17 +156,36 @@ Claude Code 可能不认。因此采取保守策略：
 - 其余情况（含完全不传）→ **主动注入 `thinking:{"type":"disabled"}`**，与 nova 的
   `shouldDisableThinking`（`llm.go:780-788`）一致；万一仍收到 `reasoning_content`，丢弃不转
 
-待验证：Anthropic 的 `thinking` 块带 `signature` 字段。初版不生成 `signature_delta`，观察 Claude Code 是否容忍；
-若不容忍则补一个占位值，并在请求转换时丢弃回传的 signature。
+~~待验证~~ **已实测（见 §11 第 1 条）**：Anthropic 的 `thinking` 块带 `signature` 字段，本网关不生成
+`signature_delta`，实测 Claude Code 容忍不带 `signature` 的 thinking 块、未报错，因此**不补占位值**；
+回传的 signature 仍在请求转换时丢弃。
 
 ## 7. 不支持能力与降级
 
 | 能力 | 处理 |
 | --- | --- |
 | 图片 / 多模态输入 | nova 模型目录未标 `Vision`（对比 `provider.go:472` 的 Gemini 显式标注）。转换层检测到 image 块即返回 `invalid_request_error`，明确说明该模型不支持图片，**不静默丢弃** |
-| `/v1/messages/count_tokens` | Ark 无此端点。本地估算（中文约 1 token/字，英文约 4 字符/token），**偏保守高估**，避免 Claude Code 低估上下文而超限 |
+| `/v1/messages/count_tokens` | Ark 无此端点。本地估算（中文约 1 token/字，非 CJK 按 3 字符/token），**偏保守高估**，避免 Claude Code 低估上下文而超限。**对工具定义系统性偏低估，见下方说明** |
+| `thinking` 枚举值 | 只校验类型（非对象 → 400），**不校验枚举值**：`{}`、`{"type":"enable"}`（拼错）一律静默按 disabled 处理，只有 `{"type":"enabled"}` 开启。与真实 Anthropic API 不对齐；且类型闸门只在 `/v1/messages` 上，同一个非法请求体打 `count_tokens` 会得到 200 |
 | prompt caching | `cache_control` 丢弃；Ark 的 `cached_tokens` 只读不可控 |
-| 输出上限 | nova 对该模型特判 32K 输出（`chat_model_budget.go:28-35`，注释指出"推理可能很长"），转换层对 `max_tokens` 做上限钳制 |
+| 输出上限 | nova 对该模型特判 32K 输出（`chat_model_budget.go:28-35`，注释指出"推理可能很长"），转换层对 `max_tokens` 做上限钳制（超限钳制而非报错） |
+
+### `count_tokens` 对工具定义偏低估（实测，接入后第一优先级）
+
+真机实测（§2 那次 curl，权威数据）：同一请求体**不带工具**时 `prompt_tokens = 89`，
+加上一个 `get_weather` 工具定义后是 **397** —— 单个工具定义的真实成本是 **308 token**。
+而那份定义的文本一共只有 77 个字符，所以**工具成本结构上不按字符长度走**，
+主体是对话模板为每个工具展开函数声明、渲染 JSON schema、附加使用说明的固定开销。
+
+当前估算模型因此改成「每个工具固定 `perToolOverhead = 300` + 定义文本按普通密度计入」
+（`internal/ark/translate/tokens.go:32-47`）。它对这个数据点准，但：
+
+- **四个常数（80 / 4 / 3 / 300）全部是从单个数据点倒推的**，未做多点校准；
+- 对**大型工具定义**（长 description、深 schema）可能仍偏低估 —— 固定开销不随定义体量增长；
+- 因此 **真机多点校准是接入后的第一优先级**。校准时以
+  `TestEstimateTokensMatchesRealToolCost` 那条真机锚定断言为准（它把「一个工具 ≥ 308 token」
+  直接写成了断言），并注意 `TestEstimateTokensCountsToolText` 已把「工具文本必须计入」
+  与该常量的取值解耦，校准那个常量不会削弱这条护栏。
 
 ## 8. 配置
 
@@ -212,9 +231,41 @@ ARK_TIMEOUT=            # 可选，默认与 Bedrock 侧对齐
 2. **第二期**：流式事件转换。工作量集中在此，但有 fixture 兜底
 3. **第三期**：count_tokens 估算、thinking 透出、max_tokens 钳制等收尾
 
-## 11. 未决问题
+## 11. 未决问题（已回填实测结论）
 
-1. thinking 块缺 `signature` 时 Claude Code 是否报错（待第三期实测）
-2. DeepSeek 的工具调用稳定性是否够支撑 Claude Code 的长链路 —— **这是模型能力问题，网关无法弥补**，
-   建议第一期落地后先小范围试用再决定是否推广
-3. Ark 侧的限流阈值与重试语义未知，第一期先沿用 Bedrock 侧的 3 次重试策略，观察后调整
+1. **thinking 块缺 `signature` 时 Claude Code 是否报错 —— 不报错，无需补占位值。**
+   实测流式响应里 thinking 块出现在 index 0（在 text 块之前）、含 17 个 `thinking_delta`、
+   **不带 `signature` 字段**，Claude Code 正常消费全程未报错。因此初版不生成 `signature_delta`
+   的决定保留，也不需要伪造占位值。客户端回传的 thinking 块仍然丢弃、不发给 Ark。
+
+2. **DeepSeek 工具调用在 Claude Code 长链路下的稳定性 —— 实测通过。**
+   完整多轮工具循环走通，有服务端日志为证：两次连续请求（2548ms 返回 `tool_use`
+   → 1602ms 基于 `tool_result` 作答）。并行双工具实测分帧**严格分组、无交错**，
+   block index 0/1 各自映射稳定，两个工具的参数各自合法且不串位。
+   结论：网关侧的转换不构成瓶颈；模型能力本身仍建议先小范围试用再推广。
+
+   ⚠️ 验证方法上的坑（值得单独记一句）：在一个 Claude Code 会话里嵌套跑 Claude Code 验证时，
+   **必须用 `CLAUDE_CONFIG_DIR` 指向独立目录做隔离**，否则内层会继承外层配置、绕过
+   `ANTHROPIC_BASE_URL` 直连官方端点 —— 现象是「全都正常」，实际一个请求都没经过网关。
+   这是本项目踩过的最大的坑，任何「验证通过」的结论都要先确认流量真的进了网关。
+
+3. **Ark 侧的限流阈值与重试语义 —— 本次验证未触发限流，无观察数据，待接入后补。**
+   实测期间没有碰到 429 或任何限流响应，因此**阈值与退避语义仍然未知**，
+   现状是沿用 Bedrock 侧同构的重试策略（`ARK_TIMEOUT` 控制非流式总时长，
+   流式只约束「等到响应头」的时间）。这条不能算已验证 —— 接入后需要观察真实限流表现再调整。
+
+## 12. 未验证项（实施完成时仍然成立的缺口）
+
+标为「已实施」指代码与用例齐备、Ark 路径已真机走通，**不代表下面这些也验证过**：
+
+1. **Bedrock 路径未做真机回归。** 实施环境没有 AWS 凭证（无 `aws` CLI、无 `AWS_*` 环境变量、
+   无 `~/.aws/`），Bedrock 真机链路跑不了。改为三项静态验收替代：
+   两条路径最实质的分叉点 `anthropic_version` / `anthropic_beta` 的注入有用例锁住
+   （`internal/anthropic/request_test.go` 的 `TestPrepareRequestKeepsAnthropicVersionForBedrock`
+   与 `TestPrepareRequestPreservesFieldsAndMapsModel`，另有两条反向用例锁 ark 路径**不**注入）；
+   `providerFor` 对 bedrock 的路由有用例覆盖；`internal/httpapi/sse.go` 相对 `main`
+   的差异经核对仅为 3 行签名改动 + 2 条日志文案。**这不等于「Bedrock 回归通过」。**
+2. **Ark 限流与重试语义无任何观察数据**（§11 第 3 条）。
+3. **`count_tokens` 的真机多点校准未完成**，四个常数均来自单个数据点（见 §7）。
+4. **`thinking` 枚举值不校验**这件事与真实 Anthropic API 的差异是已知且刻意保留的
+   （与删字段前的行为精确一致、不是回归），但**未验证 Claude Code 在写错枚举值时的表现**。

@@ -79,6 +79,36 @@ func TestEstimateTokensIncludesFixedRequestOverhead(t *testing.T) {
 	}
 }
 
+// realMinimalPrompt 是真机实测的极短请求成本（权威数据，见 docs/design §2 那次 curl）：
+// 不带工具的极短请求 prompt_tokens = 89。
+const realMinimalPrompt = 89
+
+// TestEstimateTokensDoesNotInflateFixedRequestOverhead 是上面那条的**上界配对**。
+//
+// 只有下界时 `perRequestOverhead` 从 80 改成 1000 → 九个包全绿（本任务实测）。
+// 上一轮曾有一条绝对值断言碰巧能抓住这个变异，但它是以**错误的理由**失败的
+// （报「工具成本不随数量增长」，而工具模型一行都没动），修 N2 时把那条断言正确地
+// 解耦成增量比较，却没有补上真正的上界护栏 —— 于是这个承重常量变成了单向锚定。
+//
+// 这与同一轮给 `perToolOverhead` 补上界的理由是同一条：高估是安全方向，但**不是没有代价**。
+// 固定开销打得过高会让**每一个**请求（连空请求都算上）被整体抬高，Claude Code 会误判
+// 上下文快满、提前截断或触发压缩，而在只有下界的情况下没有任何用例会响。
+//
+// 上界取实测值的两倍，与 TestEstimateTokensMatchesRealToolCost 用同一把尺子。
+func TestEstimateTokensDoesNotInflateFixedRequestOverhead(t *testing.T) {
+	t.Parallel()
+
+	count, err := EstimateTokens([]byte(`{"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("估算失败: %v", err)
+	}
+	if ceiling := realMinimalPrompt * 2; int(count) > ceiling {
+		t.Fatalf("极短请求估算 %d 超过真机实测 %d 的两倍（上界 %d）："+
+			"对话模板的固定开销打得过高会把每一个请求整体抬高，"+
+			"Claude Code 会误判上下文快满、提前截断或触发压缩", count, realMinimalPrompt, ceiling)
+	}
+}
+
 func TestEstimateTokensIsConservative(t *testing.T) {
 	t.Parallel()
 
@@ -276,6 +306,75 @@ func TestEstimateTokensScalesToolCostWithCount(t *testing.T) {
 	if three < one*5/2 {
 		t.Fatalf("三个工具的估算增量 %d 不到单个工具 %d 的 2.5 倍：工具成本必须随数量增长，"+
 			"否则带十几个工具的常态请求会严重低估", three, one)
+	}
+}
+
+// estimateWithSingleTool 返回「带**恰好一个**工具（定义为 toolJSON）」时的估算值。
+//
+// 工具数量固定为 1 是关键：`perToolOverhead * len(tools)` 这一项在两次调用里完全相同，
+// 相减后精确抵消，剩下的差值只可能来自工具定义的文本。
+func estimateWithSingleTool(t *testing.T, toolJSON string) int {
+	t.Helper()
+
+	count, err := EstimateTokens([]byte(`{"max_tokens":8,"messages":[{"role":"user","content":"hi"}],` +
+		`"tools":[` + toolJSON + `]}`))
+	if err != nil {
+		t.Fatalf("估算失败: %v", err)
+	}
+	return int(count)
+}
+
+// TestEstimateTokensCountsToolText 独立锁住「工具定义的文本必须计入估算」这件事本身，
+// 且**不依赖 perToolOverhead 的取值**。
+//
+// 为什么必须单独有这一条：TestEstimateTokensMatchesRealToolCost 与
+// TestEstimateTokensIncludesToolDefinitions 量的都是「带工具 vs 不带工具」的增量，而那个
+// 增量里固定开销占绝对主体（实测 300，而这份定义的文本只值 32）。于是把 tokens.go 里收集
+// 工具文本的那个循环整段删掉、**同时**把 perToolOverhead 调到 400（仍落在那两条用例允许的
+// 窗口 [276, 584] 内）→ 九个包全绿（本任务实测）。单删循环时也只靠 `300 < 308` 剩下的
+// 8 个 token 余量才被抓住 —— 而 `TestEstimateTokensIncludesToolDefinitions` 的失败消息
+// 声称守的就是「name/description/input_schema 必须全部计入」，它的下界 33 早被 300 的固定
+// 开销吞掉，承诺强于实际。
+//
+// 更要紧的是这是个**定时炸弹**：perToolOverhead 被明确标注「单点数据，待真机多点校准」，
+// 下次有人把它校准到 >308，「工具文本计入」这个属性就会在校准的同一刻静默失去护栏。
+//
+// 做法：两个请求都带恰好一个工具，只有工具定义的文本量不同，固定开销相减抵消，
+// 于是断言对窗口内（乃至窗口外）任何 perToolOverhead 取值都成立。
+// 三个字段各锁一条子用例：只漏掉其中一行（例如不再收集 input_schema）同样会被抓住。
+func TestEstimateTokensCountsToolText(t *testing.T) {
+	t.Parallel()
+
+	// 体量刻意给大：文本贡献要显著高于取整噪声，失败时的数字才有说服力。
+	payload := strings.Repeat("tool-definition-text-", 30)
+	// input_schema 计入的是它的**原始 JSON 字节**，所以下界按整段 schema 的长度算。
+	schema := `{"type":"object","description":"` + payload + `"}`
+
+	// 基线的工具定义是空对象：三个字段全空 → 工具文本为空串，估算里这一项恰好是 0，
+	// 于是增量不受 estimateTextTokens 向上取整的影响，下界可以直接写 len/3。
+	baseline := estimateWithSingleTool(t, `{}`)
+
+	cases := []struct {
+		field string
+		tool  string
+		text  string
+	}{
+		{"name", `{"name":"` + payload + `"}`, payload},
+		{"description", `{"description":"` + payload + `"}`, payload},
+		{"input_schema", `{"input_schema":` + schema + `}`, schema},
+	}
+	for _, tc := range cases {
+		t.Run(tc.field, func(t *testing.T) {
+			t.Parallel()
+
+			floor := len(tc.text) / 3
+			if got := estimateWithSingleTool(t, tc.tool) - baseline; got < floor {
+				t.Fatalf("工具定义的 %s 字段贡献了 %d token，低于其文本量下界 %d —— "+
+					"工具定义的文本必须计入估算。本用例与 perToolOverhead 的取值无关"+
+					"（两侧工具数量相同、固定开销已相减抵消），所以校准那个常量不会削弱它",
+					tc.field, got, floor)
+			}
+		})
 	}
 }
 

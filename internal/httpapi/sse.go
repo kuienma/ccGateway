@@ -102,7 +102,7 @@ func writeStreamChunk(w http.ResponseWriter, flusher http.Flusher, chunk []byte)
 }
 
 func (s *Server) writeStreamError(w http.ResponseWriter, r *http.Request, flusher http.Flusher, err error) {
-	s.logger.Error("Bedrock 流式请求失败", "request_id", requestID(r.Context()), "error", err)
+	s.logger.Error("上游流式请求失败", "request_id", requestID(r.Context()), "error", err)
 	_, kind, message := classifyUpstreamError(err)
 	envelope := anthropic.ErrorEnvelope{
 		Type:      errorType,
@@ -121,7 +121,7 @@ func streamEventType(chunk []byte) (string, error) {
 		Type string `json:"type"`
 	}
 	if err := json.Unmarshal(chunk, &event); err != nil || event.Type == "" {
-		return "", fmt.Errorf("Bedrock 流事件缺少有效 type")
+		return "", fmt.Errorf("上游流事件缺少有效 type")
 	}
 	return event.Type, nil
 }
