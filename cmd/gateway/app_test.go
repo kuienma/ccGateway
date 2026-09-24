@@ -46,7 +46,7 @@ func TestBuildProvidersRequiresArkKeyOnlyWhenArkModelRegistered(t *testing.T) {
 	}
 
 	bedrockOnly := newManager(t, `{"default":"a","models":[{"id":"a"}]}`)
-	providers, err := buildProviders(config.Config{}, bedrockOnly, nil)
+	providers, err := buildProviders(config.Config{}, bedrockOnly, nil, testLogger())
 	if err != nil {
 		t.Fatalf("纯 bedrock 目录不应要求 Ark 凭证: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestBuildProvidersRequiresArkKeyOnlyWhenArkModelRegistered(t *testing.T) {
 	// 有凭证就装配，与目录当前是否登记 ark 模型无关：models.Reload 挂在 SIGHUP 上，
 	// 运维随时可能热加 ark 模型，而 providers 表是启动时定死的 map，
 	// 若按目录内容决定是否装配，热加后的 ark 请求会永远拿到 500 且只能靠重启恢复。
-	providers, err = buildProviders(config.Config{ArkAPIKey: "secret"}, bedrockOnly, nil)
+	providers, err = buildProviders(config.Config{ArkAPIKey: "secret"}, bedrockOnly, nil, testLogger())
 	if err != nil {
 		t.Fatalf("有凭证时装配失败: %v", err)
 	}
@@ -69,14 +69,14 @@ func TestBuildProvidersRequiresArkKeyOnlyWhenArkModelRegistered(t *testing.T) {
 	}
 
 	withArk := newManager(t, `{"default":"a","models":[{"id":"a"},{"id":"b","provider":"ark"}]}`)
-	if _, err := buildProviders(config.Config{}, withArk, nil); err == nil ||
+	if _, err := buildProviders(config.Config{}, withArk, nil, testLogger()); err == nil ||
 		!strings.Contains(err.Error(), "ARK_API_KEY") {
 		t.Fatalf("登记了 ark 模型却缺凭证时应启动失败: %v", err)
 	}
 
 	providers, err = buildProviders(
 		config.Config{ArkAPIKey: "secret", ArkBaseURL: "https://example.test/api/v3", ArkTimeout: time.Minute},
-		withArk, nil)
+		withArk, nil, testLogger())
 	if err != nil {
 		t.Fatalf("提供凭证后装配失败: %v", err)
 	}

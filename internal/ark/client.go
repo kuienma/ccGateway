@@ -8,9 +8,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/anthropic"
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/ark/translate"
@@ -23,10 +25,29 @@ const completionsPath = "/chat/completions"
 // maxErrorBodyBytes 限制读取错误响应体的长度，避免上游返回超大 body。
 const maxErrorBodyBytes = 8 << 10
 
+// maxClientErrorMessageBytes 限制**回给客户端**的错误消息长度。
+//
+// 与读取上限（maxErrorBodyBytes）分开是刻意的：上游 body 不是
+// {"error":{"message":…}} 形状时（反向代理的 HTML 502、网关自带的纯文本错误页），
+// 兜底值是整段原文，8KiB 的错误消息既撑大响应体，也会把上游/中间代理的内部信息
+// （主机名、内部 trace id、代理厂商）透给客户端。
+//
+// 但也不把上游信息整段丢掉换成固定文案：上游错误原文对排障有实际价值（Ark 的
+// 400 会指出到底哪个字段不合法），全丢会明显降低可运维性。512 字节足够容纳
+// Ark 的真实错误消息与 HTML 错误页的 <title>，又不足以搬运大段内部细节。
+//
+// 注意这与 bedrock 路径的策略仍不一致（那边的兜底是固定文案「上游请求失败」，
+// 只有 smithy.APIError 才取上游消息）。差异已在 README 的已知限制里申报 ——
+// 不去统一是因为「Bedrock 路径行为零变化」是本分支的硬约束。
+const maxClientErrorMessageBytes = 512
+
 type Config struct {
 	APIKey  string
 	BaseURL string
 	Timeout time.Duration
+	// Logger 用于记录「协议上无法如实转达给客户端」的上游事实，目前只有
+	// finish_reason=content_filter。可以为 nil（测试常这样），此时日志被丢弃。
+	Logger *slog.Logger
 }
 
 type Client struct {
@@ -37,11 +58,17 @@ type Client struct {
 	// 流式路径刻意不用它：长回复的生命周期只由调用方的 context 控制。
 	timeout time.Duration
 	http    *http.Client
+	logger  *slog.Logger
 }
 
 func NewClient(cfg Config) *Client {
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	return &Client{
 		apiKey: cfg.APIKey,
+		logger: logger,
 		// 运维可能把 ARK_BASE_URL 写成 ".../api/v3/"，带尾斜杠会拼出
 		// //chat/completions，真实 Ark 会返回 404，这里统一归一化。
 		baseURL: strings.TrimSuffix(cfg.BaseURL, "/"),
@@ -117,6 +144,7 @@ func (c *Client) Invoke(ctx context.Context, modelID string, body []byte) ([]byt
 	if err != nil {
 		return nil, fmt.Errorf("读取 Ark 响应体: %w", err)
 	}
+	c.logContentFilter(translate.FinishReasonOf(payload), modelID, false)
 	// BuildResponse 的输入是上游响应体，出错不是客户端的责任：这里刻意返回普通
 	// error 而不是 rejectionError，让 httpapi 兜底成 5xx / api_error。
 	//
@@ -175,8 +203,38 @@ func (c *Client) errorFromResponse(response *http.Response) error {
 	return &APIError{
 		StatusCode: response.StatusCode,
 		Type:       kindForStatus(response.StatusCode),
-		Message:    message,
+		Message:    truncateErrorMessage(message),
 	}
+}
+
+// truncateErrorMessage 把回给客户端的错误消息截到 maxClientErrorMessageBytes。
+// 按 rune 边界切：从中间劈开多字节字符会让消息尾部出现替换字符，读起来像数据损坏。
+func truncateErrorMessage(message string) string {
+	if len(message) <= maxClientErrorMessageBytes {
+		return message
+	}
+	cut := maxClientErrorMessageBytes
+	for cut > 0 && !utf8.RuneStart(message[cut]) {
+		cut--
+	}
+	return message[:cut] + "…（上游错误信息已截断）"
+}
+
+// logContentFilter 在上游报 finish_reason=content_filter 时留一条 warn 日志。
+//
+// 为什么必须有它：Anthropic 的 stop_reason 枚举没有对应值，网关只能把它映射成
+// end_turn（硬造枚举会让严格校验的客户端报错，比丢语义更糟）。于是用户看到回答
+// 莫名截断，而服务端**原先连一条线索都没有**。这条日志是运维唯一能看出
+// 「这次是被内容过滤掉的」的地方。
+//
+// 级别取 warn 而不是 error：请求本身成功了（200 + 完整事件序列），不是网关或上游故障，
+// 与本仓库既有用法一致（error 留给写出失败、上游请求失败这类真实故障）。
+func (c *Client) logContentFilter(finishReason, modelID string, stream bool) {
+	if finishReason != translate.FinishReasonContentFilter {
+		return
+	}
+	c.logger.Warn("Ark 响应被内容过滤截断，stop_reason 将以 end_turn 回给客户端",
+		"model_id", modelID, "stream", stream, "finish_reason", finishReason)
 }
 
 func kindForStatus(status int) string {
@@ -220,7 +278,15 @@ func (c *Client) Stream(ctx context.Context, modelID string, body []byte, emit f
 
 	// includeThinking 与非流式 Invoke 读同一份客户端意图，两条路径不能分叉。
 	emitter := translate.NewEventEmitter(modelID, translate.WantsThinking(body), emit)
-	sawDone, err := scanSSE(response.Body, emitter.Consume)
+	// 在 chunk 已经解析好的这一层看 finish_reason：内容过滤的留痕两条路径都要有，
+	// 否则流式下「被过滤截断」在服务端同样无迹可寻。
+	consume := func(chunk translate.StreamChunk) error {
+		if len(chunk.Choices) > 0 {
+			c.logContentFilter(chunk.Choices[0].FinishReason, modelID, true)
+		}
+		return emitter.Consume(chunk)
+	}
+	sawDone, err := scanSSE(response.Body, consume)
 	// scanSSE 的错误绝不能吞掉：状态机在写 message_stop **之前**就把 finished 置真了，
 	// 那次 write 失败时 emitter 已进吸收态、Finish 只会返回 nil，此时唯一还能反映失败的
 	// 就是这个返回值。

@@ -61,6 +61,28 @@ type anthropicUsage struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
+// FinishReasonContentFilter 是 OpenAI 协议表示「被内容过滤截断」的 finish_reason。
+//
+// Anthropic 的 stop_reason 枚举里没有对应值，硬造一个会让严格校验的客户端报错，
+// 所以 MapStopReason 把它归到 end_turn —— 代价是客户端分不清「正常说完」与
+// 「被过滤截断」。为了不让这件事在服务端也无迹可寻，client 层按这个常量留一条
+// warn 日志（translate 是纯函数集合、不做 IO，所以留痕点在 client 而不是这里）。
+const FinishReasonContentFilter = "content_filter"
+
+// FinishReasonOf 从 Ark 非流式响应体里取出 finish_reason，**仅供留痕/日志使用**。
+//
+// 刻意复用 ChatResponse 而不另写一份窄结构：上游响应的形状在本包只声明一次，
+// 免得日后字段改名时漏掉这里。代价是多一次 json.Unmarshal，相对一次上游往返
+// （推理模型动辄数秒）可以忽略。解析失败或没有 choices 时返回空串 ——
+// 它不承担任何校验职责，校验在 BuildResponse。
+func FinishReasonOf(payload []byte) string {
+	var source ChatResponse
+	if err := json.Unmarshal(payload, &source); err != nil || len(source.Choices) == 0 {
+		return ""
+	}
+	return source.Choices[0].FinishReason
+}
+
 // MapStopReason 把 OpenAI 的 finish_reason 映射成 Anthropic 的 stop_reason。
 // 未知值一律按 end_turn 处理，避免客户端收到不认识的枚举。
 func MapStopReason(finishReason string) string {

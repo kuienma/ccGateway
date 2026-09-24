@@ -37,7 +37,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	providers, err := buildProviders(cfg, models, runtime)
+	providers, err := buildProviders(cfg, models, runtime, logger)
 	if err != nil {
 		return err
 	}
@@ -55,7 +55,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 //
 // 同时保留快速失败：目录里已经登记了 ark 模型却没有凭证时直接启动失败，
 // 不留到首个请求才报错。
-func buildProviders(cfg config.Config, models *modelcatalog.Manager, runtime bedrock.Runtime) (map[string]llm.Provider, error) {
+func buildProviders(cfg config.Config, models *modelcatalog.Manager, runtime bedrock.Runtime, logger *slog.Logger) (map[string]llm.Provider, error) {
 	providers := map[string]llm.Provider{llm.ProviderBedrock: runtime}
 	if cfg.ArkAPIKey == "" {
 		if models.UsesProvider(llm.ProviderArk) {
@@ -67,6 +67,9 @@ func buildProviders(cfg config.Config, models *modelcatalog.Manager, runtime bed
 		APIKey:  cfg.ArkAPIKey,
 		BaseURL: cfg.ArkBaseURL,
 		Timeout: cfg.ArkTimeout,
+		// ark 侧有「协议上无法如实转达给客户端」的事实需要留痕（内容过滤截断），
+		// 所以它需要 logger；bedrock 那边的 Runtime 由 SDK 装配，不经这里。
+		Logger: logger,
 	})
 	return providers, nil
 }

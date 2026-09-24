@@ -1,15 +1,18 @@
 package ark
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/anthropic"
 	"github.com/zhshl/bedrock-anthropic-gateway/internal/ark/translate"
@@ -450,5 +453,164 @@ func TestRejectionKindMatchesAnthropicErrorType(t *testing.T) {
 	if rejection.Kind != anthropic.ErrorTypeInvalidRequest {
 		t.Fatalf("translate 的 Rejection.Kind = %q，与 anthropic.ErrorTypeInvalidRequest %q 不一致",
 			rejection.Kind, anthropic.ErrorTypeInvalidRequest)
+	}
+}
+
+// TestInvokeTruncatesOversizedUpstreamErrorBody 钉住「上游错误原文要收紧、但不丢弃」。
+//
+// 上游 body 不是 {"error":{"message":…}} 形状时（反向代理的 HTML 502、纯文本错误页），
+// 兜底值是整段原文。原先能一路带 8KiB 回给客户端，既撑大错误响应，也会把上游/代理的
+// 内部信息透出去。现在截到 maxClientErrorMessageBytes，但**保留开头** —— 那部分
+// （状态行、<title>、Ark 的字段级说明）才是排障真正要看的。
+func TestInvokeTruncatesOversizedUpstreamErrorBody(t *testing.T) {
+	t.Parallel()
+
+	// 非 JSON 的超大 body：刻意用中文，顺便验证截断不会劈开多字节字符。
+	head := "上游代理故障："
+	body := head + strings.Repeat("内部细节", 4096)
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(body))
+	})
+
+	_, err := client.Invoke(context.Background(), "m",
+		[]byte(`{"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`))
+	if err == nil {
+		t.Fatal("上游非 2xx 必须报错")
+	}
+	var statusErr llm.StatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("错误应实现 llm.StatusError，实际 %T", err)
+	}
+	message := statusErr.ClientMessage()
+	// 上限给出余量：截断标记本身也占字节，这里只要求量级被压住（远小于 8KiB 的读取上限）。
+	if len(message) > maxClientErrorMessageBytes+64 {
+		t.Fatalf("回给客户端的错误消息长度 %d 超出上限 %d：上游错误原文必须截断",
+			len(message), maxClientErrorMessageBytes)
+	}
+	// 排障价值不能一起丢掉：开头必须留着。
+	if !strings.HasPrefix(message, head) {
+		t.Fatalf("截断后必须保留上游错误原文的开头，实际 %q", message)
+	}
+	if !strings.Contains(message, "已截断") {
+		t.Fatalf("截断后应留标记，否则运维会以为上游只说了这么多，实际 %q", message)
+	}
+	if !utf8.ValidString(message) {
+		t.Fatalf("截断必须落在 rune 边界上，实际 %q", message)
+	}
+}
+
+// TestInvokeKeepsShortUpstreamErrorMessage 是上一条的反面：常态的短错误消息必须原样保留，
+// 不能被「收紧」顺手改成固定文案 —— Ark 的 400 会指出到底哪个字段不合法，那是排障主线。
+func TestInvokeKeepsShortUpstreamErrorMessage(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"code":"InvalidParameter","message":"max_tokens 超出范围"}}`))
+	})
+
+	_, err := client.Invoke(context.Background(), "m",
+		[]byte(`{"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`))
+	var statusErr llm.StatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("错误应实现 llm.StatusError，实际 %v", err)
+	}
+	if statusErr.ClientMessage() != "max_tokens 超出范围" {
+		t.Fatalf("短消息必须原样保留，实际 %q", statusErr.ClientMessage())
+	}
+}
+
+// contentFilterResponse 是上游因内容过滤截断的非流式响应。
+const contentFilterResponse = `{"id":"r1","model":"m","choices":[{"finish_reason":"content_filter",` +
+	`"message":{"role":"assistant","content":"部分回答"}}],` +
+	`"usage":{"prompt_tokens":10,"completion_tokens":2}}`
+
+// TestInvokeLogsContentFilter 钉住内容过滤的留痕。
+//
+// Anthropic 的 stop_reason 枚举没有 content_filter，网关只能映射成 end_turn
+// （硬造枚举会让严格校验的客户端报错，比丢语义更糟）。于是用户看到回答莫名截断，
+// 而服务端原先**连一条线索都没有**。这条日志是运维唯一能看出「这次是被内容过滤掉的」
+// 的地方，所以它和那个映射是一对，缺一不可。
+func TestInvokeLogsContentFilter(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(contentFilterResponse))
+	}))
+	t.Cleanup(server.Close)
+	client := NewClient(Config{APIKey: "k", BaseURL: server.URL, Timeout: 5 * time.Second,
+		Logger: slog.New(slog.NewJSONHandler(&logs, nil))})
+
+	out, err := client.Invoke(context.Background(), "m",
+		[]byte(`{"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("Invoke 失败: %v", err)
+	}
+	// 映射本身不变（这是刻意的），所以这里同时钉住「客户端看到 end_turn」与「服务端有日志」。
+	if !strings.Contains(string(out), `"stop_reason":"end_turn"`) {
+		t.Fatalf("content_filter 仍映射为 end_turn，实际 %s", out)
+	}
+	if !strings.Contains(logs.String(), `"level":"WARN"`) || !strings.Contains(logs.String(), "内容过滤") {
+		t.Fatalf("content_filter 必须留一条 warn 日志，实际日志: %s", logs.String())
+	}
+}
+
+// TestInvokeDoesNotLogContentFilterOnNormalFinish 是上一条的反面：正常收尾不得报警，
+// 否则日志里全是狼来了，运维很快就会忽略它 —— 那等于这条留痕没做。
+func TestInvokeDoesNotLogContentFilterOnNormalFinish(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"r1","model":"m","choices":[{"finish_reason":"stop",` +
+			`"message":{"role":"assistant","content":"完整回答"}}],` +
+			`"usage":{"prompt_tokens":10,"completion_tokens":2}}`))
+	}))
+	t.Cleanup(server.Close)
+	client := NewClient(Config{APIKey: "k", BaseURL: server.URL, Timeout: 5 * time.Second,
+		Logger: slog.New(slog.NewJSONHandler(&logs, nil))})
+
+	if _, err := client.Invoke(context.Background(), "m",
+		[]byte(`{"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`)); err != nil {
+		t.Fatalf("Invoke 失败: %v", err)
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("正常收尾不应产生日志，实际 %s", logs.String())
+	}
+}
+
+// TestStreamLogsContentFilter 是流式侧的同一条留痕。
+// 两条路径都要有：只做非流式的话，Claude Code 常用的流式请求被过滤时服务端依旧无迹可寻。
+func TestStreamLogsContentFilter(t *testing.T) {
+	t.Parallel()
+
+	stream := `data: {"choices":[{"delta":{"content":"部分","role":"assistant"},"index":0}],"id":"s1","model":"m"}
+
+data: {"choices":[{"delta":{"content":"","role":"assistant"},"finish_reason":"content_filter","index":0}],"id":"s1","model":"m","usage":{"completion_tokens":2,"prompt_tokens":10}}
+
+data: [DONE]
+`
+	var logs bytes.Buffer
+	server := httptest.NewServer(streamingHandler(stream))
+	t.Cleanup(server.Close)
+	client := NewClient(Config{APIKey: "k", BaseURL: server.URL, Timeout: 5 * time.Second,
+		Logger: slog.New(slog.NewJSONHandler(&logs, nil))})
+
+	var events []string
+	if err := client.Stream(context.Background(), "m",
+		[]byte(`{"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`),
+		func(chunk []byte) error {
+			events = append(events, string(chunk))
+			return nil
+		}); err != nil {
+		t.Fatalf("Stream 失败: %v", err)
+	}
+	if !strings.Contains(strings.Join(events, ""), `"stop_reason":"end_turn"`) {
+		t.Fatalf("content_filter 仍映射为 end_turn，实际事件 %v", events)
+	}
+	if !strings.Contains(logs.String(), `"level":"WARN"`) || !strings.Contains(logs.String(), "内容过滤") {
+		t.Fatalf("流式的 content_filter 同样必须留 warn 日志，实际日志: %s", logs.String())
 	}
 }

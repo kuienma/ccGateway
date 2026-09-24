@@ -660,3 +660,46 @@ func TestBuildRequestKeepsMaxTokensUnderLimit(t *testing.T) {
 		t.Fatalf("MaxTokens = %d，未超限时必须原样下发 64", req.MaxTokens)
 	}
 }
+
+// TestBuildRequestDefaultsMissingMaxTokens 钉住「缺省时补齐我们的上限」。
+//
+// ChatRequest.MaxTokens 带 omitempty：缺省（或显式 0）时字段会整个消失，Ark 转而用它
+// 自己的默认输出上限。DeepSeek V4 Flash 把思考也计入输出，默认上限偏小会让回答在
+// 思考中途被截断（stop_reason: max_tokens + 空 content），且没有任何信号。
+//
+// 补的值刻意用钳制上限：它不是新引入的值 —— 客户端填超限值时下发的就是它。
+// 这条与 bedrock 的行为分叉（bedrock 透传给上游、由上游 400），刻意不在网关层做统一
+// 必填校验，因为那会改变 bedrock 路径的行为。差异已在 README 已知限制里申报。
+func TestBuildRequestDefaultsMissingMaxTokens(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{
+		`{"messages":[{"role":"user","content":"hi"}]}`,
+		`{"max_tokens":0,"messages":[{"role":"user","content":"hi"}]}`,
+	} {
+		req, rejection := BuildRequest("m", []byte(raw), false)
+		if rejection != nil {
+			t.Fatalf("缺省 max_tokens 不应被拒: %v", rejection)
+		}
+		// 同样写字面量而不是 MaxOutputTokens，避免同义反复（见上面那条钳制用例的说明）。
+		if req.MaxTokens != 32768 {
+			t.Fatalf("body=%s 时 MaxTokens = %d，缺省必须补到 32768，否则 Ark 用自己的默认上限、"+
+				"推理会在思考中途被静默截断", raw, req.MaxTokens)
+		}
+	}
+}
+
+// TestBuildRequestKeepsNegativeMaxTokens 记录一个刻意的选择：负值不改写。
+// 负 max_tokens 是明确的客户端错误，留给上游拒绝（客户端会拿到 400 + 上游说明）；
+// 悄悄改写成 32768 会让一个明显写错的请求「成功」，反而掩盖问题。
+func TestBuildRequestKeepsNegativeMaxTokens(t *testing.T) {
+	t.Parallel()
+
+	req, rejection := BuildRequest("m", []byte(`{"max_tokens":-1,"messages":[{"role":"user","content":"hi"}]}`), false)
+	if rejection != nil {
+		t.Fatalf("BuildRequest 失败: %v", rejection)
+	}
+	if req.MaxTokens != -1 {
+		t.Fatalf("MaxTokens = %d，负值应原样下发交由上游拒绝", req.MaxTokens)
+	}
+}

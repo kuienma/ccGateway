@@ -87,6 +87,18 @@ func BuildRequest(modelID string, anthropicBody []byte, stream bool) (*ChatReque
 	if request.MaxTokens > MaxOutputTokens {
 		request.MaxTokens = MaxOutputTokens
 	}
+	// Anthropic 协议里 max_tokens 是必填，但缺省时**不能**在网关层加统一校验：
+	// bedrock 路径靠上游返回 400，加校验就改变了 bedrock 的行为（本分支的硬约束是
+	// 「Bedrock 路径行为零变化」）。所以只在 ark 这一侧补齐：
+	// 字段带 omitempty，0 值会让 max_tokens 整个消失，Ark 转而用它自己的默认输出上限，
+	// 而 DeepSeek V4 Flash 把思考也计入输出 —— 默认上限偏小会让回答在思考中途被截断
+	// （stop_reason: max_tokens + 空 content），且没有任何信号。
+	// 回落到我们的钳制上限是方向安全的选择，而且这个值本身不是新的：
+	// 客户端填超限值时下发的就是它。负值不动 —— 那是明确的客户端错误，留给上游拒绝，
+	// 悄悄改写成 32768 反而掩盖问题。两条路径的这处差异已在 README 已知限制里申报。
+	if request.MaxTokens == 0 {
+		request.MaxTokens = MaxOutputTokens
+	}
 	if stream {
 		// 末尾额外一个 choices 为空的 usage chunk，用于拿到真实 token 数。
 		request.StreamOptions = &StreamOptions{IncludeUsage: true}
