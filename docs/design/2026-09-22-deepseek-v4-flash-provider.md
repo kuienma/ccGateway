@@ -36,12 +36,23 @@ DeepSeek 说的是 OpenAI Chat Completions 协议，因此透传对它直接失�
 | --- | --- |
 | 流式 `tool_calls` 增量 | 标准 OpenAI 形状；首发 chunk 带 `id` + `function.name` + 空 `arguments` + `index`，后续只有 `arguments` 片段 |
 | `arguments` 分片边界 | 会断在 JSON 语法中间：`{"city": "` → `北京` → `"` → `, "unit": "` → `c` → `elsius` → `"` → `}` |
-| 并行多工具 | 支持，`index:0` / `index:1` 各自独立 call id，chunk 交错但 index 可靠 |
+| 并行多工具 | 支持，`index:0` / `index:1` 各自独立 call id；**分片按工具分组下发、无交错**，`index` 可靠（与 §11 第 2 条的真机复核一致） |
 | 多轮 `tool_result` 回传 | 正常闭环，喂 `role:"tool"` + `tool_call_id` 后能基于结果作答 |
 | `thinking:{"type":"disabled"}` | 被接受，`reasoning_content` 归零 |
 | 不传 `thinking` | **默认思考开启**，返回 `reasoning_content` 与 `completion_tokens_details.reasoning_tokens` |
-| `stream_options.include_usage` | 支持；末尾多一个 `choices:[]` 的纯 usage chunk，再 `data: [DONE]` |
+| `stream_options.include_usage` | 支持；**usage 在末尾出现两次** —— 带 `finish_reason` 的那个 chunk 上就有一份，之后还有一个 `choices:[]` 的纯 usage chunk（同一份数字），再 `data: [DONE]` |
 | 事件顺序 | `reasoning_content` **全部吐完**才开始 `tool_calls` / `content` |
+
+> ⚠️ **流式 usage 依赖上游一个非标准行为。** OpenAI 规范只要求在末尾那个 `choices:[]` chunk 上给
+> usage；Ark **额外**在 `finish_reason` 那个 chunk 上也给一份，而本网关的状态机正是靠这一份：
+> `EventEmitter.complete()` 在收到 `finish_reason` 的那一刻就写出带 usage 的 `message_delta`
+> 并置 `finished`，之后那个纯 usage chunk 会被早退丢弃。
+> 真机 fixture（`internal/ark/sse_test.go` 的 `arkToolStream`、`internal/ark/stream_test.go` 的
+> `arkReasoningStream`，两者的 finish chunk 都带 usage）证实今天的 Ark 确实如此，**所以这不是
+> 活跃缺陷**。但它是单点依赖：上游哪天规范化（usage 只在末尾给），每一次流式请求的
+> `message_delta` 都会报 `input_tokens: 0 / output_tokens: 0`，**不报错、不打日志**。
+> 失效表现已在 README 已知限制里申报。真要彻底修，得把 `message_delta` + `message_stop`
+> 从 `complete()` 推迟到 `Finish()`，那是改被 review 过两轮的状态机，不在接入前做。
 
 两个对设计有利的事实：
 
@@ -99,7 +110,7 @@ Anthropic 的 `index` 是**全局递增的 content block 序号**，而 OpenAI �
 
 | Ark / OpenAI | Anthropic 事件 |
 | --- | --- |
-| 首个 chunk 到达 | `message_start`（`input_tokens` 用本地估算占位，末尾用真实值修正） |
+| 首个 chunk 到达 | `message_start`（`usage` 里 **`input_tokens` / `output_tokens` 都填 0 占位**，真实值只在末尾的 `message_delta` 给） |
 | `delta.reasoning_content` 首次非空 | `content_block_start`(thinking) + `content_block_delta`(`thinking_delta`) |
 | `delta.reasoning_content` 后续 | `content_block_delta`(`thinking_delta`) |
 | 出现非空 `content` 或 `tool_calls` | 先给上一块 `content_block_stop` |
@@ -109,7 +120,19 @@ Anthropic 的 `index` 是**全局递增的 content block 序号**，而 OpenAI �
 | `finish_reason` 出现 | `content_block_stop` + `message_delta`{stop_reason, usage.output_tokens} + `message_stop` |
 | `data: [DONE]` | 不产生事件，仅作完整性哨兵 |
 
-`finish_reason` → `stop_reason`：`stop`→`end_turn`，`tool_calls`→`tool_use`，`length`→`max_tokens`。
+`finish_reason` → `stop_reason`：`stop`→`end_turn`，`tool_calls`→`tool_use`，`length`→`max_tokens`，
+其余（含 `content_filter`）→ `end_turn`。`content_filter` 的语义在 Anthropic 枚举里没有对应值，
+只能并进 `end_turn`，但 `ark.Client` 会为它记一条 warn 日志（见 §7 的保真度说明）。
+
+> ⚠️ **`message_start` 的 `input_tokens` 填 0，不是估算值**（`internal/ark/translate/events.go`
+> 的 `ensureStarted`，用例 `events_test.go` 把这个 0 钉成了刻意的时序设计）。真实 Anthropic API
+> 在 `message_start` 就给真值，本网关的 ark 路径不给 —— 只读 `message_start.usage` 的客户端会
+> 永远看到 0。
+>
+> **这一条对将来的 `count_tokens` 真机校准很重要**：校准要拿真实 `input_tokens` 做锚，
+> 而流式路径的真值**只在 `message_delta` 里**。若采样脚本从 `message_start` 取值，会得到
+> 一串 0，进而把「估算严重偏高」这种完全相反的结论喂给校准 —— 那会把估算往低估方向调，
+> 正是 §7 要求避免的方向。非流式路径没有这个坑（`usage` 在响应体里一次给全）。
 
 ### 必须遵守的三条不变式
 
@@ -137,11 +160,13 @@ Anthropic 的 `index` 是**全局递增的 content block 序号**，而 OpenAI �
 | assistant `tool_use` 块 | `tool_calls[{id, type:"function", function:{name, arguments}}]`，`input` 序列化为字符串 |
 | user `tool_result` 块 | 拆成独立 `{"role":"tool", tool_call_id, content}` message |
 | assistant `thinking` 块（历史回传） | **丢弃**（Ark 不接受回传 reasoning） |
+| `tool_result.is_error` | **丢弃**（OpenAI 的 `role:"tool"` 消息没有失败标记字段）；模型只能从工具回包的文本自行推断失败 |
+| `tool_choice.disable_parallel_tool_use` | **丢弃**（OpenAI 的 `tool_choice` 无对应开关）；客户端要求禁用并行工具时 ark 路径仍可能并行 |
 | `tools[].input_schema` | `tools[].function.parameters` |
 | `tool_choice` auto/any/tool | `"auto"` / `"required"` / `{"type":"function","function":{"name":…}}` |
 | `stop_sequences` | `stop` |
 | `metadata.user_id` | `user` |
-| `temperature` / `top_p` / `max_tokens` | 同名 |
+| `temperature` / `top_p` / `max_tokens` | 同名；`max_tokens` 缺省（或为 0）时补成 32768（见 §7「输出上限」） |
 | `top_k` | 丢弃（无对应） |
 | `cache_control` | 丢弃（Ark 是自动缓存，语义不同） |
 | image 块 | **拦截报错**（见 §7） |
@@ -168,7 +193,10 @@ Claude Code 可能不认。因此采取保守策略：
 | `/v1/messages/count_tokens` | Ark 无此端点。本地估算（中文约 1 token/字，非 CJK 按 3 字符/token），**偏保守高估**，避免 Claude Code 低估上下文而超限。**对工具定义系统性偏低估，见下方说明** |
 | `thinking` 枚举值 | 只校验类型（非对象 → 400），**不校验枚举值**：`{}`、`{"type":"enable"}`（拼错）一律静默按 disabled 处理，只有 `{"type":"enabled"}` 开启。与真实 Anthropic API 不对齐；且类型闸门只在 `/v1/messages` 上，同一个非法请求体打 `count_tokens` 会得到 200 |
 | prompt caching | `cache_control` 丢弃；Ark 的 `cached_tokens` 只读不可控 |
-| 输出上限 | nova 对该模型特判 32K 输出（`chat_model_budget.go:28-35`，注释指出"推理可能很长"），转换层对 `max_tokens` 做上限钳制（超限钳制而非报错） |
+| 输出上限 | nova 对该模型特判 32K 输出（`chat_model_budget.go:28-35`，注释指出"推理可能很长"），转换层对 `max_tokens` 做上限钳制（超限钳制而非报错）。**缺省时补成同一个 32768**：字段带 `omitempty`，不下发会让 Ark 用自己的默认上限，而思考也计入输出 —— 上限偏小会让回答在思考中途被截断（`stop_reason: max_tokens` + 空 content）且无任何信号。**这一处与 bedrock 路径行为不同**（bedrock 透传缺省值、由上游返回 400）：不在网关层加统一必填校验，因为那会改变 bedrock 的行为。负值不改写，留给上游拒绝 |
+| `stop_reason` 保真度 | `content_filter` 与「命中 stop sequence」都被映射成 `end_turn`，且 `stop_sequence` 恒为 `null`（上游不回显命中的停止词）。客户端因此无法区分「正常说完」／「被内容过滤截断」／「命中停止词」。**不改映射**（Anthropic 枚举无对应值，硬造会让严格校验的客户端报错），但 `content_filter` 会在 `ark.Client` 记一条 warn 日志（两条路径都有），这是运维唯一能看出「这次是被过滤掉的」的线索 |
+| 上游协议违约 | 三类情形硬失败而不是把损坏数据转发给客户端：①`tool_calls` 缺 id / name；②一次响应里两个调用共用同一个 `tool_use.id`（客户端会把两次调用混为一次）；③`arguments` 拼完不是 JSON 对象（`null`、半截 JSON、标量、数组）。流式与非流式两侧对齐。流式还有第四类：**并行工具的参数分片若交错下发**，状态机无法处理，流会中途报错（真机实测是严格分组、无交错，见 §11 第 2 条） |
+| 上游错误原文 | 上游错误体里的消息回给客户端，但截到 512 字节（`maxClientErrorMessageBytes`）：非 JSON 形状时兜底值是整段原文，8KiB 既撑大响应也可能泄漏上游/代理的内部细节。**与 bedrock 侧策略不同**（那边兜底是固定文案「上游请求失败」，只有 `smithy.APIError` 才取上游消息）—— 保留差异是因为「Bedrock 路径行为零变化」是本次的硬约束 |
 
 ### `count_tokens` 对工具定义偏低估（实测，接入后第一优先级）
 
@@ -263,9 +291,17 @@ ARK_TIMEOUT=            # 可选，默认与 Bedrock 侧对齐
    两条路径最实质的分叉点 `anthropic_version` / `anthropic_beta` 的注入有用例锁住
    （`internal/anthropic/request_test.go` 的 `TestPrepareRequestKeepsAnthropicVersionForBedrock`
    与 `TestPrepareRequestPreservesFieldsAndMapsModel`，另有两条反向用例锁 ark 路径**不**注入）；
-   `providerFor` 对 bedrock 的路由有用例覆盖；`internal/httpapi/sse.go` 相对 `main`
+   `providerFor` 的路由在**两个 provider 同时在册**（即唯一会上线的配置）的前提下有正反两向的
+   用例覆盖，三个入口各一组，且每条都同时断言「另一个 provider 没被调用」
+   （`internal/httpapi/routing_test.go`）；`internal/httpapi/sse.go` 相对 `main`
    的差异经核对仅为 3 行签名改动 + 2 条日志文案。**这不等于「Bedrock 回归通过」。**
 2. **Ark 限流与重试语义无任何观察数据**（§11 第 3 条）。
 3. **`count_tokens` 的真机多点校准未完成**，四个常数均来自单个数据点（见 §7）。
 4. **`thinking` 枚举值不校验**这件事与真实 Anthropic API 的差异是已知且刻意保留的
    （与删字段前的行为精确一致、不是回归），但**未验证 Claude Code 在写错枚举值时的表现**。
+   （若将来要补枚举值校验，必须同时让 `EstimateTokens` 也走 `parseThinking`，否则
+   `/v1/messages` 与 `count_tokens` 会多出一处新的两侧分叉。）
+5. **`max_tokens = 32768` 未经真机确认被 Ark 接受。** 真机那次 curl 用的是小 `max_tokens`，
+   钳制路径（客户端填超限值 → 下发 32768）与新补的缺省路径（不填 → 下发 32768）走的是
+   同一个值，但都没有真机样本。值本身取自 nova 生产对该模型的特判上限，风险低；
+   若接入后看到「不带 `max_tokens` 的请求一律 400」，先查这一条。

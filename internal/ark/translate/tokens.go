@@ -48,6 +48,13 @@ const perToolOverhead = 300
 
 // maxContentDepth 限制 content 嵌套的递归深度。
 // 超过之后按原始 JSON 长度计入 —— 宁可多算，不可漏算。
+//
+// 这个分支是**可达**的（实测 tool_result 嵌套 5 层起结果就从 90 变成 109），
+// 所以别把它当成不可达的防御代码。它没有专门的护栏用例，理由是**它不承重**：
+// 旋钮误设在两个方向上都安全 —— 调小 → 更早回落到「按原始 JSON 文本计入」→ 偏**高**估
+// （JSON 语法字符也被算进去）；调大 → 正常递归 → 正确值。而 EstimateTokens 的方向性
+// 要求恰恰是「宁可高估」。真要补一条用例，价值在于把「深嵌套回落到原始 JSON 长度」
+// 这个行为写成文档，而不是防止误设。
 const maxContentDepth = 4
 
 // EstimateTokens 本地估算 Anthropic 请求体的输入 token 数。

@@ -180,6 +180,14 @@ kill -HUP <gateway-pid>
 - **`thinking` 字段只校验类型、不校验枚举值。** 只有 `{"type":"enabled"}` 才开启思考；`{}`、`{"type":"enable"}`（拼错）、`{"type":"whatever"}` 都会被**静默当作 disabled**，没有任何报错或警告。这与真实 Anthropic API 不对齐（后者会拒绝非法枚举值）。写错时的现象是「以为开了思考、其实没开」，排查时值得先确认这个拼写。另外 `thinking` 写成对象以外的类型（字符串、数字、数组、布尔）会返回 400，但**只有 `/v1/messages` 这条路径有这个类型闸门**：同一个请求体打 `/v1/messages/count_tokens` 会得到 200，打 `/v1/messages` 得到 400。
 - **`max_tokens` 上限 32768，超限钳制而非报错。** DeepSeek V4 Flash 是推理模型、思考部分也计入输出，故上限取 32K；客户端要求更大时网关钳制到 32768 并照常请求，不会因此失败。
 - **`reasoning_tokens` 不计入 `output_tokens`。** 它是 `completion_tokens` 的内部明细（`prompt + completion = total` 恒等、`reasoning < completion`），不是额外加项 —— 不要在统计口径上把它再加一遍。
+- **`max_tokens` 缺省时网关补成 32768，与 Bedrock 路径不同。** Anthropic 协议里 `max_tokens` 是必填。Bedrock 路径把缺省原样透传、由上游返回 400；ark 路径不下发就会让 Ark 用它自己的默认输出上限，而该模型把思考也计入输出，上限偏小会让回答在思考中途被截断（`stop_reason: max_tokens` + 空 content）且没有任何信号，所以这里补成钳制上限 32768。负值不改写，留给上游拒绝。**Claude Code 总会带 `max_tokens`，这条只影响其他客户端。**
+- **流式 `usage` 依赖 Ark 的一个非标准行为。** OpenAI 规范只要求在末尾那个 `choices:[]` chunk 上给 usage，Ark 额外在 `finish_reason` 那个 chunk 上也给一份，而网关的状态机正是靠这一份（收到 `finish_reason` 就立即写出带 usage 的 `message_delta`）。真机确实如此，**今天不是缺陷**；但上游一旦规范化，每次流式请求的 `message_delta` 都会报 `input_tokens: 0 / output_tokens: 0`，**不报错也不打日志**。如果哪天看到流式 usage 全是 0、非流式却正常，就是这条。非流式不受影响。
+- **流式 `message_start.usage` 恒为 0。** 真实 Anthropic API 在 `message_start` 就给 `input_tokens` 真值，ark 路径填 0 占位，真值只在末尾的 `message_delta` 里。只读 `message_start` 的客户端在 ark 路径上永远看到 0；做 token 采样／校准时必须从 `message_delta` 取。
+- **`stop_reason` 有保真度损失。** `content_filter`（内容过滤截断）与「命中 `stop_sequences`」都会变成 `end_turn`，且 `stop_sequence` 恒为 `null`。客户端因此无法区分「正常说完」／「被过滤截断」／「命中停止词」。不改映射是刻意的：Anthropic 的枚举里没有对应值，硬造一个会让严格校验的客户端报错。**内容过滤这一种在服务端会记一条 warn 日志**（`Ark 响应被内容过滤截断…`，流式与非流式都有）—— 回答莫名截断时先查这条日志。
+- **`tool_result.is_error` 被丢弃。** OpenAI 的 `role:"tool"` 消息没有失败标记字段，网关把 `is_error: true` 静默丢掉，模型只能从工具回包的文本自行推断失败。多轮工具循环里这会降低纠错率（Claude Code 用 `is_error` 表达命令失败），所以工具失败时让回包文本自己说清楚（例如以 `error:` 开头）比依赖这个字段可靠。
+- **`tool_choice.disable_parallel_tool_use` 被丢弃。** OpenAI 的 `tool_choice` 没有对应开关。客户端要求禁用并行工具时，ark 路径仍可能一次返回多个 `tool_use` 块。
+- **上游协议违约时宁可报错，也不转发损坏数据。** 以下情形网关直接失败（流式会在流中途发 `error` 事件）：`tool_calls` 缺 `id` / `name`；一次响应里两个工具调用共用同一个 id（客户端会把两次调用混为一次，第二个工具的结果永远回不去）；`arguments` 拼完不是 JSON 对象（`null`、半截 JSON、标量、数组）。另外**上游一旦交错下发并行工具的参数分片，流式会报错**（真机实测是严格分组、无交错，状态机按此实现；真出现交错需要改成缓冲方案）。
+- **上游错误原文截到 512 字节，与 Bedrock 路径策略不同。** 上游错误体不是 `{"error":{"message":…}}` 形状时（反向代理的 HTML 502、纯文本错误页），网关取其原文开头回给客户端并标注「已截断」。保留开头是为了排障（Ark 的 400 会点名不合法的字段），截断是为了不撑大错误响应、也不把上游／代理的内部细节整段透出。Bedrock 路径的兜底仍是固定文案「上游请求失败」，两条路径在这点上不统一。
 
 ## Docker
 
