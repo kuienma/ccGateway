@@ -66,6 +66,11 @@ func (r *runtimeStub) CountTokens(_ context.Context, modelID string, body []byte
 	return r.tokenCount, r.err
 }
 
+// called 报告这个 stub 是否被调用过。
+// 三个方法都会写 body（哪怕 body 为空也会变成非 nil 的空切片），所以它比看 modelID
+// 可靠：modelID 为空串既可能是「没被调用」，也可能是「被调用但 modelID 真的是空串」。
+func (r *runtimeStub) called() bool { return r.body != nil }
+
 const testGatewayKey = "test-gateway-key"
 
 func newTestServer(runtime *runtimeStub, resolver resolverStub) *Server {
