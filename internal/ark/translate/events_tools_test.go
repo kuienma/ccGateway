@@ -551,6 +551,11 @@ func TestEventEmitterRejectsNonObjectToolArguments(t *testing.T) {
 		{"数字标量", []string{"123"}},
 		{"字符串标量", []string{`"abc"`}},
 		{"布尔", []string{"true"}},
+		// 纯空白单独列一条：它守的不是「空白不是对象」这件显然的事，而是
+		// **两侧判空用同一条判据**。非流式是 len(input) == 0，纯空白在那里长度非 0、
+		// 会被拒；流式若把判空写成 bytes.TrimSpace，纯空白就成了「无参数」而放行 ——
+		// 而此时 "   " 已经作为 partial_json 转发给客户端了。这是同一个漂移的最后一格。
+		{"纯空白", []string{"   "}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

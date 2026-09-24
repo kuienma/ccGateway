@@ -1,7 +1,6 @@
 package translate
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 )
@@ -338,7 +337,12 @@ func (e *EventEmitter) closeOpenBlock() error {
 func (e *EventEmitter) validateOpenToolArgs() error {
 	// 上游一个分片都没给（或只给了空串）等价于「无参数」：content_block_start 里已经
 	// 填了 input:{}，与非流式把空 arguments 当作 {} 的处理一致。
-	if len(bytes.TrimSpace(e.openToolArgs)) == 0 {
+	//
+	// 判空刻意用 len 而不是 bytes.TrimSpace：非流式那侧是 len(input) == 0，
+	// 纯空白（"   "）在它那里长度非 0，会走到下面的 Unmarshal 并被拒。
+	// 这里若用 TrimSpace，纯空白就成了「无参数」而被放行 —— 可分片已经作为
+	// partial_json 转发出去了，客户端拿到的是无法解析的 "   "。两侧必须同一条判据。
+	if len(e.openToolArgs) == 0 {
 		return nil
 	}
 	// 与非流式同一条语义：不能只用 json.Valid —— 123 / "abc" / [1,2] / true / null
