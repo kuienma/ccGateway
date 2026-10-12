@@ -69,7 +69,7 @@ func TestBuildRequestConvertsToolUseAndToolResult(t *testing.T) {
 	}
 
 	assistant := req.Messages[1]
-	if assistant.Role != "assistant" || assistant.Content != "我查一下" {
+	if assistant.Role != "assistant" || assistant.Content.Text != "我查一下" {
 		t.Fatalf("assistant 文本应保留，实际 %#v", assistant)
 	}
 	if len(assistant.ToolCalls) != 1 {
@@ -94,8 +94,8 @@ func TestBuildRequestConvertsToolUseAndToolResult(t *testing.T) {
 	if result.ToolCallID != "toolu_1" {
 		t.Fatalf("ToolCallID = %q", result.ToolCallID)
 	}
-	if result.Content != "18度晴" {
-		t.Fatalf("Content = %q", result.Content)
+	if result.Content.Text != "18度晴" {
+		t.Fatalf("Content = %q", result.Content.Text)
 	}
 }
 
@@ -136,8 +136,8 @@ func TestBuildRequestFlattensToolResultBlockContent(t *testing.T) {
 	if rejection != nil {
 		t.Fatalf("不应被拒绝: %v", rejection)
 	}
-	if req.Messages[0].Content != "结果" {
-		t.Fatalf("tool_result 的块数组 content 应压平，实际 %q", req.Messages[0].Content)
+	if req.Messages[0].Content.Text != "结果" {
+		t.Fatalf("tool_result 的块数组 content 应压平，实际 %q", req.Messages[0].Content.Text)
 	}
 }
 
@@ -159,8 +159,8 @@ func TestBuildRequestDropsHistoricalThinkingBlocks(t *testing.T) {
 	if rejection != nil {
 		t.Fatalf("历史 thinking 块应被丢弃而非报错: %v", rejection)
 	}
-	if req.Messages[1].Content != "答案" {
-		t.Fatalf("thinking 内容不应进入 content，实际 %q", req.Messages[1].Content)
+	if req.Messages[1].Content.Text != "答案" {
+		t.Fatalf("thinking 内容不应进入 content，实际 %q", req.Messages[1].Content.Text)
 	}
 }
 
@@ -291,7 +291,7 @@ func TestBuildRequestOrdersToolResultsBeforeText(t *testing.T) {
 	}
 	for offset, expected := range want {
 		got := req.Messages[2+offset]
-		actual := shape{got.Role, got.Content, got.ToolCallID}
+		actual := shape{got.Role, got.Content.Text, got.ToolCallID}
 		if actual != expected {
 			t.Fatalf("Messages[%d] = %#v，期望 %#v", 2+offset, actual, expected)
 		}
@@ -339,7 +339,7 @@ func TestBuildRequestKeepsEmptyContentMessage(t *testing.T) {
 	if len(req.Messages) != 1 {
 		t.Fatalf("空 content 的消息仍应产出一条消息，实际 %d 条: %#v", len(req.Messages), req.Messages)
 	}
-	if req.Messages[0].Role != "user" || req.Messages[0].Content != "" {
+	if req.Messages[0].Role != "user" || req.Messages[0].Content.Text != "" {
 		t.Fatalf("应产出一条空内容的 user 消息，实际 %#v", req.Messages[0])
 	}
 }

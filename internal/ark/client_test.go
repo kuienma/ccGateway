@@ -119,7 +119,62 @@ func TestInvokeFallsBackToRequestedModelWhenUpstreamOmitsModel(t *testing.T) {
 	}
 }
 
-func TestInvokeRejectsImageBeforeCallingUpstream(t *testing.T) {
+// TestInvokeSendsImageURLUpstream 锁住图片真的发到了上游，而不是只在
+// translate 单测里序列化正确：content 必须是 parts 数组，图片是 image_url
+// 形态的 data URI。模型是否支持图片由 Ark 判定，网关不再本地拦。
+func TestInvokeSendsImageURLUpstream(t *testing.T) {
+	t.Parallel()
+
+	var received []byte
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		received, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"r1","model":"m","choices":[{"finish_reason":"stop",
+			"message":{"role":"assistant","content":"一张截图"}}],
+			"usage":{"prompt_tokens":5,"completion_tokens":2}}`))
+	})
+
+	body := []byte(`{"max_tokens":64,"messages":[{"role":"user","content":[
+		{"type":"text","text":"这是什么"},
+		{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBOR"}}]}]}`)
+	if _, err := client.Invoke(context.Background(), "m", body); err != nil {
+		t.Fatalf("含图片的请求不应失败: %v", err)
+	}
+
+	var upstream struct {
+		Messages []struct {
+			Content []struct {
+				Type     string `json:"type"`
+				Text     string `json:"text"`
+				ImageURL *struct {
+					URL string `json:"url"`
+				} `json:"image_url"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(received, &upstream); err != nil {
+		t.Fatalf("上游收到的 content 不是 parts 数组: %v\nbody = %s", err, received)
+	}
+	if len(upstream.Messages) != 1 || len(upstream.Messages[0].Content) != 2 {
+		t.Fatalf("应下发 1 条消息 2 个 part，实际 %s", received)
+	}
+
+	parts := upstream.Messages[0].Content
+	if parts[0].Type != "text" || parts[0].Text != "这是什么" {
+		t.Fatalf("parts[0] 应是文本块，实际 %#v", parts[0])
+	}
+	if parts[1].Type != "image_url" {
+		t.Fatalf("parts[1].type = %q，期望 image_url", parts[1].Type)
+	}
+	if parts[1].ImageURL == nil || parts[1].ImageURL.URL != "data:image/png;base64,iVBOR" {
+		t.Fatalf("parts[1].image_url 不符，实际 %#v", parts[1].ImageURL)
+	}
+}
+
+// 合法图片现在会转成 image_url 正常下发（见 TestInvokeSendsImageURLUpstream），
+// 这里改用缺 source 的畸形图片块，锁住的不变量没变：
+// 转换阶段就能判定非法的请求不该白打一次上游。
+func TestInvokeRejectsMalformedImageBeforeCallingUpstream(t *testing.T) {
 	t.Parallel()
 
 	called := false
@@ -128,10 +183,10 @@ func TestInvokeRejectsImageBeforeCallingUpstream(t *testing.T) {
 	})
 
 	body := []byte(`{"max_tokens":64,"messages":[{"role":"user","content":[
-		{"type":"image","source":{"type":"base64","media_type":"image/png","data":"x"}}]}]}`)
+		{"type":"image"}]}]}`)
 	_, err := client.Invoke(context.Background(), "m", body)
 	if err == nil {
-		t.Fatal("含图片的请求必须报错")
+		t.Fatal("畸形图片块必须报错")
 	}
 	if called {
 		t.Fatal("转换阶段被拒绝的请求不应发往上游")

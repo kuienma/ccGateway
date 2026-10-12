@@ -24,6 +24,28 @@
         "deepseek-v4-flash",
         "ds-flash"
       ]
+    },
+    {
+      "id": "ep-20260820174604-5w25w",
+      "provider": "ark",
+      "aliases": [
+        "kimi-k3",
+        "Kimi-k3"
+      ]
+    },
+    {
+      "id": "ep-20260915141030-mc7mq",
+      "provider": "ark",
+      "aliases": [
+        "deepseek-v4.1-flash"
+      ]
+    },
+    {
+      "id": "ep-20260820145211-jrkpz",
+      "provider": "ark",
+      "aliases": [
+        "glm-5.3"
+      ]
     }
   ]
 }

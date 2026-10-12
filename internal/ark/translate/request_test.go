@@ -50,13 +50,13 @@ func TestBuildRequestLiftsSystemAndMapsBasics(t *testing.T) {
 	if len(req.Messages) != 3 {
 		t.Fatalf("消息数 = %d，期望 3（system + user + assistant）", len(req.Messages))
 	}
-	if req.Messages[0].Role != "system" || req.Messages[0].Content != "你是助手" {
+	if req.Messages[0].Role != "system" || req.Messages[0].Content.Text != "你是助手" {
 		t.Fatalf("首条应为 system，实际 %#v", req.Messages[0])
 	}
-	if req.Messages[1].Role != "user" || req.Messages[1].Content != "你好" {
+	if req.Messages[1].Role != "user" || req.Messages[1].Content.Text != "你好" {
 		t.Fatalf("Messages[1] = %#v", req.Messages[1])
 	}
-	if req.Messages[2].Role != "assistant" || req.Messages[2].Content != "在" {
+	if req.Messages[2].Role != "assistant" || req.Messages[2].Content.Text != "在" {
 		t.Fatalf("Messages[2] = %#v", req.Messages[2])
 	}
 }
@@ -76,8 +76,8 @@ func TestBuildRequestJoinsMultipleTextBlocks(t *testing.T) {
 	if rejection != nil {
 		t.Fatalf("不应被拒绝: %v", rejection)
 	}
-	if req.Messages[0].Content != "第一段\n\n第二段" {
-		t.Fatalf("多文本块应以空行连接，实际 %q", req.Messages[0].Content)
+	if req.Messages[0].Content.Text != "第一段\n\n第二段" {
+		t.Fatalf("多文本块应以空行连接，实际 %q", req.Messages[0].Content.Text)
 	}
 	if req.Stream {
 		t.Fatal("非流式请求 Stream 应为 false")
@@ -100,35 +100,13 @@ func TestBuildRequestLiftsSystemBlockArray(t *testing.T) {
 	if rejection != nil {
 		t.Fatalf("不应被拒绝: %v", rejection)
 	}
-	if req.Messages[0].Role != "system" || req.Messages[0].Content != "规则一\n\n规则二" {
+	if req.Messages[0].Role != "system" || req.Messages[0].Content.Text != "规则一\n\n规则二" {
 		t.Fatalf("system 块数组应合并，实际 %#v", req.Messages[0])
 	}
 }
 
-func TestBuildRequestRejectsImageBlock(t *testing.T) {
-	t.Parallel()
-
-	raw := []byte(`{
-		"max_tokens": 64,
-		"messages": [{"role": "user", "content": [
-			{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR"}}
-		]}]
-	}`)
-
-	req, rejection := BuildRequest("m", raw, false)
-	if req != nil {
-		t.Fatal("含图片的请求不应返回 ChatRequest")
-	}
-	if rejection == nil {
-		t.Fatal("含图片的请求必须被拒绝，不能静默丢弃")
-	}
-	if rejection.Kind != "invalid_request_error" {
-		t.Fatalf("Kind = %q", rejection.Kind)
-	}
-	if !strings.Contains(rejection.Message, "图片") {
-		t.Fatalf("错误信息应说明不支持图片，实际 %q", rejection.Message)
-	}
-}
+// 消息正文里的图片块从「一律拒绝」改成转成 OpenAI image_url 下发，
+// 新行为的断言见 request_image_test.go。
 
 func TestBuildRequestDropsUnsupportedFields(t *testing.T) {
 	t.Parallel()

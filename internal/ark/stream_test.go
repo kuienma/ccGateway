@@ -344,16 +344,16 @@ func TestStreamEmitsNothingWhenUpstreamStatusIsNot2xx(t *testing.T) {
 	}
 }
 
-func TestStreamRejectsImageBeforeCallingUpstream(t *testing.T) {
+func TestStreamRejectsMalformedImageBeforeCallingUpstream(t *testing.T) {
 	t.Parallel()
 
 	called := false
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) { called = true })
 
 	body := []byte(`{"max_tokens":64,"messages":[{"role":"user","content":[
-		{"type":"image","source":{"type":"base64","media_type":"image/png","data":"x"}}]}]}`)
+		{"type":"image"}]}]}`)
 	if err := client.Stream(context.Background(), "m", body, func([]byte) error { return nil }); err == nil {
-		t.Fatal("含图片的流式请求必须报错")
+		t.Fatal("畸形图片块的流式请求必须报错")
 	}
 	if called {
 		t.Fatal("被拒绝的请求不应发往上游")

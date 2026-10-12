@@ -148,8 +148,14 @@ func collectEstimateText(raw json.RawMessage, depth int) string {
 			parts = append(parts, collectEstimateText(block.Content, depth+1))
 		default:
 			// image / document / 未来新增的块类型：按原始 JSON 长度计入（base64 数据
-			// 也算在内）。这类块在 BuildRequest 阶段会被拒绝，真实请求走不到计费，
-			// 但 count_tokens 是独立端点，客户端完全可以只问不发 —— 宁可多算。
+			// 也算在内）。
+			//
+			// 对 image 来说这会**严重高估**：base64 原文动辄几十万字符，真实视觉
+			// token 通常只有几百到几千。放开图片下发后这条估算已经会被真实请求走到
+			// （此前图片在 BuildRequest 阶段就被拒，走不到计费）。没有改成按图片
+			// 尺寸估算，是因为 Ark 的视觉计费规则未经真机确认，凭空换一个公式只是
+			// 把高估换成不知方向的偏差。方向安全这一点仍然成立 —— 低估会让客户端
+			// 误以为上下文还有余量、真实请求被上游拒绝。已在 README 已知限制申报。
 			parts = append(parts, string(rawBlock))
 		}
 	}

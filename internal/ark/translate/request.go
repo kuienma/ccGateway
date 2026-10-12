@@ -64,6 +64,16 @@ type anthropicBlock struct {
 	Content   json.RawMessage `json:"content"`
 	IsError   bool            `json:"is_error"`
 	Thinking  string          `json:"thinking"`
+	// Source 用指针，因为「没有 source」和「source 是空对象」要给出不同的错误。
+	Source *anthropicImageSource `json:"source"`
+}
+
+// anthropicImageSource 是 image 块的 source，base64 与 url 两种形态的字段并集。
+type anthropicImageSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
+	URL       string `json:"url"`
 }
 
 // BuildRequest 把 Anthropic 请求体转成 Ark 请求。
@@ -157,7 +167,7 @@ func BuildRequest(modelID string, anthropicBody []byte, stream bool) (*ChatReque
 			return nil, rejection
 		}
 		if system != "" {
-			request.Messages = append(request.Messages, ChatMessage{Role: "system", Content: system})
+			request.Messages = append(request.Messages, ChatMessage{Role: "system", Content: TextContent(system)})
 		}
 	}
 
@@ -224,7 +234,7 @@ func convertMessage(index int, message anthropicMessage) ([]ChatMessage, *Reject
 		if rejection != nil {
 			return nil, rejection
 		}
-		return []ChatMessage{{Role: message.Role, Content: text}}, nil
+		return []ChatMessage{{Role: message.Role, Content: TextContent(text)}}, nil
 	}
 
 	var blocks []anthropicBlock
@@ -233,7 +243,10 @@ func convertMessage(index int, message anthropicMessage) ([]ChatMessage, *Reject
 	}
 
 	var (
-		texts     []string
+		// parts 按客户端给的块顺序累积。图文顺序承载指代关系
+		// （「这张图上面那段文字」），重排会改变语义。
+		parts     []ContentPart
+		hasImage  bool
 		toolCalls []ToolCall
 		results   []ChatMessage
 	)
@@ -241,8 +254,15 @@ func convertMessage(index int, message anthropicMessage) ([]ChatMessage, *Reject
 		switch block.Type {
 		case "text":
 			if block.Text != "" {
-				texts = append(texts, block.Text)
+				parts = append(parts, ContentPart{Type: "text", Text: block.Text})
 			}
+		case "image":
+			part, rejection := convertImageSource(block.Source, fmt.Sprintf("%s[%d]", field, blockIndex))
+			if rejection != nil {
+				return nil, rejection
+			}
+			parts = append(parts, part)
+			hasImage = true
 		case "thinking", "redacted_thinking":
 			// 历史推理内容不回传给 Ark，丢弃。
 		case "tool_use":
@@ -268,20 +288,15 @@ func convertMessage(index int, message anthropicMessage) ([]ChatMessage, *Reject
 					Message: fmt.Sprintf("%s[%d] tool_result 缺少 tool_use_id", field, blockIndex),
 				}
 			}
-			content, rejection := flattenText(block.Content, fmt.Sprintf("%s[%d].content", field, blockIndex))
+			content, rejection := flattenText(block.Content, fmt.Sprintf("%s[%d] tool_result 的 content", field, blockIndex))
 			if rejection != nil {
 				return nil, rejection
 			}
 			results = append(results, ChatMessage{
 				Role:       "tool",
-				Content:    content,
+				Content:    TextContent(content),
 				ToolCallID: block.ToolUseID,
 			})
-		case "image":
-			return nil, &Rejection{
-				Kind:    kindInvalidRequest,
-				Message: "该模型不支持图片输入，请移除消息中的图片块",
-			}
 		case "":
 			return nil, &Rejection{
 				Kind:    kindInvalidRequest,
@@ -300,17 +315,86 @@ func convertMessage(index int, message anthropicMessage) ([]ChatMessage, *Reject
 	// Anthropic 允许 tool_result 与 text 混在同一条消息里，所以这里要重排。
 	converted := results
 
-	// 有文本或工具调用时产出主消息；内容全是 tool_result 时不产出（已拆成独立的
+	// 有内容块或工具调用时产出主消息；内容全是 tool_result 时不产出（已拆成独立的
 	// role=tool 消息）；内容真的为空时仍产出一条空消息，因为丢消息会破坏 Ark 侧
 	// user/assistant 交替，比发一条空消息更危险。
-	if len(texts) > 0 || len(toolCalls) > 0 || len(results) == 0 {
+	if len(parts) > 0 || len(toolCalls) > 0 || len(results) == 0 {
 		converted = append(converted, ChatMessage{
 			Role:      message.Role,
-			Content:   strings.Join(texts, blockSeparator),
+			Content:   buildContent(parts, hasImage),
 			ToolCalls: toolCalls,
 		})
 	}
 	return converted, nil
+}
+
+// buildContent 决定 content 用字符串还是 parts 数组下发。
+// 没有图片时合并成字符串，保持放开图片之前的线上格式逐字节不变；
+// 有图片时保留数组，以维持图文的原始顺序。
+func buildContent(parts []ContentPart, hasImage bool) MessageContent {
+	if hasImage {
+		return MessageContent{Parts: parts}
+	}
+	texts := make([]string, 0, len(parts))
+	for _, part := range parts {
+		texts = append(texts, part.Text)
+	}
+	return TextContent(strings.Join(texts, blockSeparator))
+}
+
+// convertImageSource 把 Anthropic 的 image.source 转成 OpenAI 的 image_url part。
+// field 是该图片块的路径，用于错误定位。
+//
+// 这里刻意不校验模型是否支持图片：网关内置一份模型能力表必然会过期
+// （放开图片之前那句「该模型不支持图片输入」正是这么来的 —— 它是接第一个
+// 不支持图片的 endpoint 时写死的，后来接了支持图片的模型就开始误报）。
+// 能力的权威在上游，不支持图片的模型由 Ark 自己返回 400。
+func convertImageSource(source *anthropicImageSource, field string) (ContentPart, *Rejection) {
+	if source == nil {
+		return ContentPart{}, &Rejection{
+			Kind:    kindInvalidRequest,
+			Message: field + " image 缺少 source",
+		}
+	}
+	switch source.Type {
+	case "base64":
+		if source.MediaType == "" {
+			return ContentPart{}, &Rejection{
+				Kind:    kindInvalidRequest,
+				Message: field + " image.source 缺少 media_type",
+			}
+		}
+		if source.Data == "" {
+			return ContentPart{}, &Rejection{
+				Kind:    kindInvalidRequest,
+				Message: field + " image.source 缺少 data",
+			}
+		}
+		// OpenAI 协议没有独立的 base64 入参，图片一律走 url 字段的 data URI 形态。
+		return imageURLPart("data:" + source.MediaType + ";base64," + source.Data), nil
+	case "url":
+		if source.URL == "" {
+			return ContentPart{}, &Rejection{
+				Kind:    kindInvalidRequest,
+				Message: field + " image.source 缺少 url",
+			}
+		}
+		return imageURLPart(source.URL), nil
+	case "":
+		return ContentPart{}, &Rejection{
+			Kind:    kindInvalidRequest,
+			Message: field + " image.source 缺少 type",
+		}
+	default:
+		return ContentPart{}, &Rejection{
+			Kind:    kindInvalidRequest,
+			Message: fmt.Sprintf("%s image.source.type 不支持: %s", field, source.Type),
+		}
+	}
+}
+
+func imageURLPart(url string) ContentPart {
+	return ContentPart{Type: "image_url", ImageURL: &ImageURL{URL: url}}
 }
 
 // flattenText 把 Anthropic 的 content（字符串或块数组）压成单个字符串。
@@ -342,9 +426,13 @@ func flattenText(raw json.RawMessage, field string) (string, *Rejection) {
 				parts = append(parts, block.Text)
 			}
 		case "image":
+			// 消息正文里的图片已经能转成 image_url part（见 convertMessage），
+			// 但走到 flattenText 的是 system 与 tool_result：OpenAI 协议里
+			// 这两处的 content 只能是字符串，放不下图片。文案必须点明是**位置**
+			// 不支持，否则用户会以为换个模型就能用。
 			return "", &Rejection{
 				Kind:    kindInvalidRequest,
-				Message: "该模型不支持图片输入，请移除消息中的图片块",
+				Message: field + " 不支持图片块：该位置在 OpenAI 协议里只能是纯文本",
 			}
 		case "":
 			return "", &Rejection{

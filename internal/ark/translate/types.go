@@ -30,10 +30,50 @@ type Thinking struct {
 }
 
 type ChatMessage struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Role       string         `json:"role"`
+	Content    MessageContent `json:"content"`
+	ToolCalls  []ToolCall     `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+}
+
+// MessageContent 是 OpenAI 消息的 content 字段，它在协议里有两种合法形态：
+// 字符串，或 content parts 数组。
+//
+// 不含图片时**必须**序列化成字符串：放开图片是在既有线上格式之外加一条新路径，
+// 把所有请求都改成 parts 数组是另一回事（Ark 对两种形态的兼容程度、以及
+// role=tool 这类只接受字符串的消息，都不在本次改动的验证范围内）。
+// 回归锁见 TestBuildRequestKeepsPlainTextContentAsString。
+type MessageContent struct {
+	// Text 在 Parts 为空时生效，直接序列化成字符串。
+	Text string
+	// Parts 非空时取代 Text，序列化成 content parts 数组。
+	Parts []ContentPart
+}
+
+// TextContent 构造纯文本形态的 content。
+func TextContent(text string) MessageContent {
+	return MessageContent{Text: text}
+}
+
+func (c MessageContent) MarshalJSON() ([]byte, error) {
+	if len(c.Parts) == 0 {
+		return json.Marshal(c.Text)
+	}
+	return json.Marshal(c.Parts)
+}
+
+// ContentPart 是 content parts 数组的元素，按 Type 取用其余字段。
+type ContentPart struct {
+	Type string `json:"type"`
+	// Text 带 omitempty：image_url part 不能带 text 字段。
+	// 代价是空文本会让 type=text 的 part 丢掉 text 字段而不合法，
+	// 所以产出 text part 前必须保证文本非空（见 convertMessage）。
+	Text     string    `json:"text,omitempty"`
+	ImageURL *ImageURL `json:"image_url,omitempty"`
+}
+
+type ImageURL struct {
+	URL string `json:"url"`
 }
 
 type ToolCall struct {
