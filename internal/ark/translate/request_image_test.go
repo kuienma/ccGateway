@@ -170,31 +170,44 @@ func TestBuildRequestRejectsImageWithoutSourceData(t *testing.T) {
 	}
 }
 
-// TestBuildRequestRejectsImageInToolResult tool_result 里的图片仍然要拒绝，
-// 但理由不是「模型不支持」而是「OpenAI 的 role=tool 消息 content 只能是字符串」。
-// 文案必须讲清位置，否则用户会以为换个模型就能用。
-func TestBuildRequestRejectsImageInToolResult(t *testing.T) {
+// TestBuildRequestMovesImageOutOfToolResult tool_result 里的图片不再被拒绝，
+// 而是搬到一条合成 user 消息 —— OpenAI 的 role=tool 消息 content 只能是
+// 字符串，装不下图片 part，但正文 user 消息装得下。
+// 原位留 marker 而不是静默丢弃，见 request_tool_image_test.go 的完整覆盖。
+func TestBuildRequestMovesImageOutOfToolResult(t *testing.T) {
 	t.Parallel()
 
 	raw := []byte(`{
 		"max_tokens": 64,
-		"messages": [{"role": "user", "content": [
-			{"type": "tool_result", "tool_use_id": "t-1", "content": [
-				{"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}
+		"messages": [
+			{"role": "assistant", "content": [
+				{"type": "tool_use", "id": "t-1", "name": "Read", "input": {}}
+			]},
+			{"role": "user", "content": [
+				{"type": "tool_result", "tool_use_id": "t-1", "content": [
+					{"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}
+				]}
 			]}
-		]}]
+		]
 	}`)
 
 	req, rejection := BuildRequest("m", raw, false)
-	if req != nil {
-		t.Fatal("tool_result 含图片不应返回 ChatRequest")
+	if rejection != nil {
+		t.Fatalf("tool_result 里的图片应被搬走而非拒绝: %v", rejection)
 	}
-	if rejection == nil {
-		t.Fatal("tool_result 含图片必须被拒绝，不能静默丢图")
+	if len(req.Messages) != 3 {
+		t.Fatalf("应产出 assistant + tool + user 三条，实际 %d", len(req.Messages))
 	}
-	if !strings.Contains(rejection.Message, "tool_result") {
-		t.Fatalf("文案须点明是 tool_result 位置不支持，实际 %q", rejection.Message)
+	if req.Messages[1].Role != "tool" || req.Messages[2].Role != "user" {
+		t.Fatalf("顺序应为 tool 在前、合成 user 在后，实际 %s/%s",
+			req.Messages[1].Role, req.Messages[2].Role)
 	}
+	if strings.Contains(req.Messages[1].Content.Text, "example.com") {
+		t.Fatalf("tool 消息不该再含图片 URL，实际 %q", req.Messages[1].Content.Text)
+	}
+	assertContentJSON(t, req.Messages[2].Content,
+		`[{"type":"text","text":"[tool result media of t-1]"},`+
+			`{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]`)
 }
 
 func assertContentJSON(t *testing.T, content MessageContent, want string) {

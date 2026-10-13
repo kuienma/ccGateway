@@ -11,6 +11,17 @@ const blockSeparator = "\n\n"
 
 const kindInvalidRequest = "invalid_request_error"
 
+// toolResultMediaMarker 替换 tool_result 里被抽走的图片，原位留痕。
+// OpenAI 协议中 role=tool 的 content 只能是字符串，装不下图片 part，
+// 所以图片挪到紧随其后的一条合成 user 消息（见 convertMessage）。
+// 留 marker 而不是静默删除：模型能看出「这里曾有图」，用户也能排查。
+const toolResultMediaMarker = "[tool result media moved to the following user message]"
+
+// minImageDataURLBytes 是「整段字符串是不是一张图」的最小长度阈值（8KB）。
+// 低于它的 data URL 继续当普通文本，避免把刻意检查小图标/微小内联数据的
+// 工作流误判成图片搬走。阈值语义与 CC Switch 的 WHOLE_DATA_URL_MIN_BYTES 一致。
+const minImageDataURLBytes = 8 * 1024
+
 // anthropicRequest 只声明需要转换的字段，其余（top_k、cache_control 等）随解析丢弃。
 type anthropicRequest struct {
 	System        json.RawMessage    `json:"system"`
@@ -249,6 +260,9 @@ func convertMessage(index int, message anthropicMessage) ([]ChatMessage, *Reject
 		hasImage  bool
 		toolCalls []ToolCall
 		results   []ChatMessage
+		// toolMedia 收集从 tool_result 里抽出的图片，等所有 tool 消息都
+		// 落位后合并成一条合成 user 消息（见循环后的 flush）。
+		toolMedia []ContentPart
 	)
 	for blockIndex, block := range blocks {
 		switch block.Type {
@@ -288,9 +302,17 @@ func convertMessage(index int, message anthropicMessage) ([]ChatMessage, *Reject
 					Message: fmt.Sprintf("%s[%d] tool_result 缺少 tool_use_id", field, blockIndex),
 				}
 			}
-			content, rejection := flattenText(block.Content, fmt.Sprintf("%s[%d] tool_result 的 content", field, blockIndex))
+			content, media, rejection := extractToolResultContent(block.Content, fmt.Sprintf("%s[%d] tool_result 的 content", field, blockIndex))
 			if rejection != nil {
 				return nil, rejection
+			}
+			if len(media) > 0 {
+				// 给这条 tool_result 的图片加归属标注，多图时能对上是哪个调用产出的。
+				toolMedia = append(toolMedia, ContentPart{
+					Type: "text",
+					Text: fmt.Sprintf("[tool result media of %s]", block.ToolUseID),
+				})
+				toolMedia = append(toolMedia, media...)
 			}
 			results = append(results, ChatMessage{
 				Role:       "tool",
@@ -314,6 +336,16 @@ func convertMessage(index int, message anthropicMessage) ([]ChatMessage, *Reject
 	// tool_calls 的 assistant 消息，中间插入一条 user 消息会打断这个绑定。
 	// Anthropic 允许 tool_result 与 text 混在同一条消息里，所以这里要重排。
 	converted := results
+
+	// 抽出的 tool 图片统一放进一条合成 user 消息，排在**所有** tool 消息之后、
+	// 主消息之前。顺序不能变：OpenAI 要求 role=tool 紧跟带 tool_calls 的
+	// assistant，把它们与合成 user 消息交错会打断这个绑定。
+	if len(toolMedia) > 0 {
+		converted = append(converted, ChatMessage{
+			Role:    "user",
+			Content: MessageContent{Parts: toolMedia},
+		})
+	}
 
 	// 有内容块或工具调用时产出主消息；内容全是 tool_result 时不产出（已拆成独立的
 	// role=tool 消息）；内容真的为空时仍产出一条空消息，因为丢消息会破坏 Ark 侧
@@ -397,8 +429,92 @@ func imageURLPart(url string) ContentPart {
 	return ContentPart{Type: "image_url", ImageURL: &ImageURL{URL: url}}
 }
 
+// extractToolResultContent 压平 tool_result 的 content，并把其中的图片抽出来
+// 交给调用方搬到合成 user 消息（OpenAI 协议里 role=tool 装不下图片 part）。
+//
+// 返回的文本已把图片位置替换成 marker；media 是抽出的图片，可能为空。
+func extractToolResultContent(raw json.RawMessage, field string) (string, []ContentPart, *Rejection) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return "", nil, nil
+	}
+
+	if trimmed[0] == '"' {
+		var text string
+		if err := json.Unmarshal(raw, &text); err != nil {
+			return "", nil, &Rejection{Kind: kindInvalidRequest, Message: field + " 必须是字符串或块数组"}
+		}
+		// 整段字符串就是一张 data URL 时抽出为图片，原位留 marker。
+		if part, ok := wholeStringImageDataURL(text); ok {
+			return toolResultMediaMarker, []ContentPart{part}, nil
+		}
+		return text, nil, nil
+	}
+
+	var blocks []anthropicBlock
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return "", nil, &Rejection{Kind: kindInvalidRequest, Message: field + " 必须是字符串或块数组"}
+	}
+
+	var (
+		parts []string
+		media []ContentPart
+	)
+	for blockIndex, block := range blocks {
+		switch block.Type {
+		case "text":
+			if block.Text != "" {
+				parts = append(parts, block.Text)
+			}
+		case "image":
+			part, rejection := convertImageSource(block.Source, fmt.Sprintf("%s[%d]", field, blockIndex))
+			if rejection != nil {
+				return "", nil, rejection
+			}
+			media = append(media, part)
+			parts = append(parts, toolResultMediaMarker)
+		case "":
+			return "", nil, &Rejection{
+				Kind:    kindInvalidRequest,
+				Message: fmt.Sprintf("%s[%d] 缺少 type", field, blockIndex),
+			}
+		default:
+			return "", nil, &Rejection{
+				Kind:    kindInvalidRequest,
+				Message: fmt.Sprintf("%s[%d] 不支持的块类型: %s", field, blockIndex, block.Type),
+			}
+		}
+	}
+	return strings.Join(parts, blockSeparator), media, nil
+}
+
+// wholeStringImageDataURL 判断一个字符串是不是「整段就是一张 base64 图片」。
+// 只认整段匹配：嵌在 HTML/CSS/SVG 里的 data URL 是文本内容，不动它。
+// 小于 minImageDataURLBytes 的也不认，保住刻意检查小图标的用法。
+func wholeStringImageDataURL(value string) (ContentPart, bool) {
+	trimmed := strings.TrimSpace(value)
+	if len(trimmed) < minImageDataURLBytes || !isImageBase64DataURL(trimmed) {
+		return ContentPart{}, false
+	}
+	return imageURLPart(trimmed), true
+}
+
+// isImageBase64DataURL 判断是否为 data:image/...;base64,... 形态。
+func isImageBase64DataURL(value string) bool {
+	comma := strings.Index(value, ",")
+	if comma < 0 {
+		return false
+	}
+	header := strings.ToLower(value[:comma])
+	return strings.HasPrefix(header, "data:image/") && strings.HasSuffix(header, ";base64")
+}
+
 // flattenText 把 Anthropic 的 content（字符串或块数组）压成单个字符串。
-// 遇到图片块直接拒绝；未知块类型也拒绝，避免静默丢内容。
+// 图片块被拒绝；未知块类型也拒绝，避免静默丢内容。
+//
+// 只有 system 走这条路：tool_result 已改走 extractToolResultContent，
+// 那里的图片会被搬到合成 user 消息，而 system 必须是最前面那条消息，
+// 无法用「插一条后续消息」承载图片，所以继续拒绝。
 func flattenText(raw json.RawMessage, field string) (string, *Rejection) {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" || trimmed == "null" {
@@ -426,10 +542,9 @@ func flattenText(raw json.RawMessage, field string) (string, *Rejection) {
 				parts = append(parts, block.Text)
 			}
 		case "image":
-			// 消息正文里的图片已经能转成 image_url part（见 convertMessage），
-			// 但走到 flattenText 的是 system 与 tool_result：OpenAI 协议里
-			// 这两处的 content 只能是字符串，放不下图片。文案必须点明是**位置**
-			// 不支持，否则用户会以为换个模型就能用。
+			// system 无法用「插一条后续消息」承载图片（它必须是最前面那条），
+			// 所以这里继续拒绝。文案必须点明是**位置**不支持，
+			// 否则用户会以为换个模型就能用。
 			return "", &Rejection{
 				Kind:    kindInvalidRequest,
 				Message: field + " 不支持图片块：该位置在 OpenAI 协议里只能是纯文本",
